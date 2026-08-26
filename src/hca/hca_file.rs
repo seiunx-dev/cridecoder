@@ -702,7 +702,11 @@ fn decode_chunk_pcm(a: DecodeChunkArgs<'_>) -> Result<Vec<u8>, HcaError> {
                 imdct_overlap(dct0, &mut a.prev[0], a.wave);
                 imdct_overlap(dct1, &mut a.prev[1], &mut wave2);
                 let out = &mut a.pcm[sf * 256..(sf + 1) * 256];
-                for (pair, (&l, &r)) in out.chunks_exact_mut(2).zip(a.wave.iter().zip(wave2.iter()))
+                for (pair, (&l, &r)) in out
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                    .zip(a.wave.iter().zip(wave2.iter()))
                 {
                     pair[0] = pcm_f32_to_i16(l);
                     pair[1] = pcm_f32_to_i16(r);

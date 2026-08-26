@@ -179,8 +179,8 @@ const fn build_crc16_slice() -> [[u16; 256]; 8] {
 /// naive loop (verified in tests) but ~5x faster over a full frame.
 pub fn crc16_checksum(data: &[u8]) -> u16 {
     let mut sum: u16 = 0;
-    let mut chunks = data.chunks_exact(8);
-    for c in &mut chunks {
+    let (chunks, remainder) = data.as_chunks::<8>();
+    for c in chunks {
         let i0 = ((sum >> 8) as u8 ^ c[0]) as usize;
         let i1 = (sum as u8 ^ c[1]) as usize;
         sum = CRC16_SLICE[7][i0]
@@ -192,7 +192,7 @@ pub fn crc16_checksum(data: &[u8]) -> u16 {
             ^ CRC16_SLICE[1][c[6] as usize]
             ^ CRC16_SLICE[0][c[7] as usize];
     }
-    for &byte in chunks.remainder() {
+    for &byte in remainder {
         sum = (sum << 8) ^ CRC16_TABLE[((sum >> 8) ^ byte as u16) as usize];
     }
     sum
@@ -1024,7 +1024,9 @@ impl ClHca {
                 }
             }
             for (ch, chunk) in out
-                .chunks_exact_mut(HCA_SAMPLES_PER_FRAME)
+                .as_chunks_mut::<HCA_SAMPLES_PER_FRAME>()
+                .0
+                .iter_mut()
                 .enumerate()
                 .take(channels)
             {

@@ -341,15 +341,14 @@ fn mask_video(buf: &mut [u8], vmask: &VideoMask) {
     // Second pass: original i in 0x100..size -> buf[0x140..len]. 0x100 is
     // 32-aligned, so row position j maps to mask lane j.
     {
-        let mut chunks = buf[0x140..len].chunks_exact_mut(MASK_LEN);
-        for row in &mut chunks {
-            let row: &mut [u8; MASK_LEN] = row.try_into().unwrap();
+        let (chunks, remainder) = buf[0x140..len].as_chunks_mut::<MASK_LEN>();
+        for row in chunks {
             for j in 0..MASK_LEN {
                 row[j] ^= mask[j];
                 mask[j] = row[j] ^ vm1[j];
             }
         }
-        for (j, b) in chunks.into_remainder().iter_mut().enumerate() {
+        for (j, b) in remainder.iter_mut().enumerate() {
             *b ^= mask[j];
             mask[j] = *b ^ vm1[j];
         }
@@ -371,14 +370,13 @@ fn mask_audio(buf: &mut [u8], amask: &AudioMask) {
     let Some(region) = buf.get_mut(0x140..) else {
         return;
     };
-    let mut chunks = region.chunks_exact_mut(MASK_LEN);
-    for row in &mut chunks {
-        let row: &mut [u8; MASK_LEN] = row.try_into().unwrap();
+    let (chunks, remainder) = region.as_chunks_mut::<MASK_LEN>();
+    for row in chunks {
         for j in 0..MASK_LEN {
             row[j] ^= amask[j];
         }
     }
-    for (j, b) in chunks.into_remainder().iter_mut().enumerate() {
+    for (j, b) in remainder.iter_mut().enumerate() {
         *b ^= amask[j];
     }
 }
