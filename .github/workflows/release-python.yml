@@ -58,7 +58,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           sed -i '' "1,/^version = .*/{s/^version = .*/version = \"${VERSION}\"/;}" Cargo.toml
           sed -i '' "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: |
             3.9
@@ -95,7 +95,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           sed -i "0,/^version = .*/s//version = \"${VERSION}\"/" Cargo.toml
           sed -i "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: |
             3.9
