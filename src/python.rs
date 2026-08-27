@@ -27,13 +27,13 @@ use crate::usm::UsmBuilder;
 /// Returns:
 ///     List of extracted file paths, or None if the file is invalid
 #[pyfunction]
-fn extract_acb(acb_path: &str, output_dir: &str) -> PyResult<Option<Vec<String>>> {
+fn extract_acb(py: Python<'_>, acb_path: &str, output_dir: &str) -> PyResult<Option<Vec<String>>> {
     let acb_path = Path::new(acb_path);
     let output_dir = Path::new(output_dir);
     fs::create_dir_all(output_dir)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create output dir: {}", e)))?;
 
-    acb::extract_acb_from_file(acb_path, output_dir)
+    py.detach(|| acb::extract_acb_from_file(acb_path, output_dir))
         .map_err(|e| PyRuntimeError::new_err(format!("ACB extraction failed: {}", e)))
 }
 
@@ -61,7 +61,8 @@ fn extract_acb_tracks<'py>(
     fs::create_dir_all(output_dir)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create output dir: {}", e)))?;
 
-    let tracks = acb::extract_acb_tracks_from_file(acb_path, output_dir)
+    let tracks = py
+        .detach(|| acb::extract_acb_tracks_from_file(acb_path, output_dir))
         .map_err(|e| PyRuntimeError::new_err(format!("ACB extraction failed: {}", e)))?;
 
     let tracks = match tracks {
@@ -131,7 +132,8 @@ fn extract_acb_bytes<'py>(
     py: Python<'py>,
     acb_data: &[u8],
 ) -> PyResult<Vec<Bound<'py, pyo3::types::PyDict>>> {
-    let tracks = acb::extract_acb_to_memory(Cursor::new(acb_data), None)
+    let tracks = py
+        .detach(|| acb::extract_acb_to_memory(Cursor::new(acb_data), None))
         .map_err(|e| PyRuntimeError::new_err(format!("ACB extraction failed: {}", e)))?;
 
     let mut out = Vec::with_capacity(tracks.len());
@@ -164,7 +166,8 @@ fn extract_acb_unique_bytes<'py>(
     py: Python<'py>,
     acb_data: &[u8],
 ) -> PyResult<Vec<Bound<'py, pyo3::types::PyDict>>> {
-    let waveforms = acb::extract_acb_unique_to_memory(Cursor::new(acb_data), None)
+    let waveforms = py
+        .detach(|| acb::extract_acb_unique_to_memory(Cursor::new(acb_data), None))
         .map_err(|e| PyRuntimeError::new_err(format!("ACB extraction failed: {}", e)))?;
 
     let mut out = Vec::with_capacity(waveforms.len());
@@ -235,7 +238,11 @@ fn decode_acb_to_wav_bytes<'py>(
 /// Returns:
 ///     None on success
 #[pyfunction]
-fn build_acb(tracks: Vec<(String, u32, Vec<u8>)>, output_path: &str) -> PyResult<()> {
+fn build_acb(
+    py: Python<'_>,
+    tracks: Vec<(String, u32, Vec<u8>)>,
+    output_path: &str,
+) -> PyResult<()> {
     let mut builder = AcbBuilder::new();
 
     for (name, cue_id, data) in tracks {
@@ -246,8 +253,7 @@ fn build_acb(tracks: Vec<(String, u32, Vec<u8>)>, output_path: &str) -> PyResult
     let mut output = fs::File::create(output_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create output file: {}", e)))?;
 
-    builder
-        .build(&mut output, None)
+    py.detach(|| builder.build(&mut output, None))
         .map_err(|e| PyRuntimeError::new_err(format!("ACB build failed: {}", e)))?;
 
     Ok(())
@@ -261,7 +267,7 @@ fn build_acb(tracks: Vec<(String, u32, Vec<u8>)>, output_path: &str) -> PyResult
 /// Returns:
 ///     ACB file data as bytes
 #[pyfunction]
-fn build_acb_bytes(tracks: Vec<(String, u32, Vec<u8>)>) -> PyResult<Vec<u8>> {
+fn build_acb_bytes(py: Python<'_>, tracks: Vec<(String, u32, Vec<u8>)>) -> PyResult<Vec<u8>> {
     let mut builder = AcbBuilder::new();
 
     for (name, cue_id, data) in tracks {
@@ -269,12 +275,13 @@ fn build_acb_bytes(tracks: Vec<(String, u32, Vec<u8>)>) -> PyResult<Vec<u8>> {
         builder.add_track(track);
     }
 
-    let mut output = Cursor::new(Vec::new());
-    builder
-        .build(&mut output, None)
-        .map_err(|e| PyRuntimeError::new_err(format!("ACB build failed: {}", e)))?;
-
-    Ok(output.into_inner())
+    py.detach(|| {
+        let mut output = Cursor::new(Vec::new());
+        builder
+            .build(&mut output, None)
+            .map(|_| output.into_inner())
+    })
+    .map_err(|e| PyRuntimeError::new_err(format!("ACB build failed: {}", e)))
 }
 
 /// Build a single-track music ACB from one HCA track (returns bytes).
@@ -303,6 +310,7 @@ fn build_acb_bytes(tracks: Vec<(String, u32, Vec<u8>)>) -> PyResult<Vec<u8>> {
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn build_music_acb_bytes(
+    py: Python<'_>,
     name: String,
     hca_data: Vec<u8>,
     cue_id: u32,
@@ -340,12 +348,13 @@ fn build_music_acb_bytes(
     );
     builder.add_track(TrackInput::new(name, cue_id, hca_data));
 
-    let mut output = Cursor::new(Vec::new());
-    builder
-        .build(&mut output, None)
-        .map_err(|e| PyRuntimeError::new_err(format!("Music ACB build failed: {}", e)))?;
-
-    Ok(output.into_inner())
+    py.detach(|| {
+        let mut output = Cursor::new(Vec::new());
+        builder
+            .build(&mut output, None)
+            .map(|_| output.into_inner())
+    })
+    .map_err(|e| PyRuntimeError::new_err(format!("Music ACB build failed: {}", e)))
 }
 
 /// Resolve the optional `threads` argument shared by the HCA decode bindings:
@@ -453,6 +462,18 @@ fn decode_hca_bytes(
 #[pyfunction]
 #[pyo3(signature = (wav_data, sample_rate=None, channels=None, bitrate=256000, encryption_key=None))]
 fn encode_hca_bytes(
+    py: Python<'_>,
+    wav_data: &[u8],
+    sample_rate: Option<u32>,
+    channels: Option<u32>,
+    bitrate: u32,
+    encryption_key: Option<u64>,
+) -> PyResult<Vec<u8>> {
+    py.detach(|| encode_wav_to_hca(wav_data, sample_rate, channels, bitrate, encryption_key))
+}
+
+/// GIL-free core of the HCA encode bindings (WAV parse + PCM convert + encode).
+fn encode_wav_to_hca(
     wav_data: &[u8],
     sample_rate: Option<u32>,
     channels: Option<u32>,
@@ -595,13 +616,16 @@ fn encode_hca<'py>(
     bitrate: u32,
     encryption_key: Option<u64>,
 ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    let wav_data = fs::read(wav_path)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to read WAV: {}", e)))?;
+    let hca_data = py.detach(|| {
+        let wav_data = fs::read(wav_path)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to read WAV: {}", e)))?;
 
-    let hca_data = encode_hca_bytes(&wav_data, None, None, bitrate, encryption_key)?;
+        let hca_data = encode_wav_to_hca(&wav_data, None, None, bitrate, encryption_key)?;
 
-    fs::write(hca_path, &hca_data)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to write HCA: {}", e)))?;
+        fs::write(hca_path, &hca_data)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to write HCA: {}", e)))?;
+        Ok::<_, PyErr>(hca_data)
+    })?;
 
     let dict = pyo3::types::PyDict::new(py);
     dict.set_item("size", hca_data.len())?;
@@ -623,6 +647,7 @@ fn encode_hca<'py>(
 #[pyfunction]
 #[pyo3(signature = (usm_path, output_dir, key=None, export_audio=false))]
 fn extract_usm(
+    py: Python<'_>,
     usm_path: &str,
     output_dir: &str,
     key: Option<u64>,
@@ -633,7 +658,8 @@ fn extract_usm(
     fs::create_dir_all(output_dir)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create output dir: {}", e)))?;
 
-    let files = usm::extract_usm_file(usm_path, output_dir, key, export_audio)
+    let files = py
+        .detach(|| usm::extract_usm_file(usm_path, output_dir, key, export_audio))
         .map_err(|e| PyRuntimeError::new_err(format!("USM extraction failed: {}", e)))?;
 
     Ok(files
@@ -663,7 +689,8 @@ fn extract_usm_bytes<'py>(
     key: Option<u64>,
     export_audio: bool,
 ) -> PyResult<Vec<Bound<'py, pyo3::types::PyDict>>> {
-    let streams = usm::extract_usm_to_memory(Cursor::new(usm_data), b"", key, export_audio)
+    let streams = py
+        .detach(|| usm::extract_usm_to_memory(Cursor::new(usm_data), b"", key, export_audio))
         .map_err(|e| PyRuntimeError::new_err(format!("USM extraction failed: {}", e)))?;
 
     let mut out = Vec::with_capacity(streams.len());
@@ -690,6 +717,7 @@ fn extract_usm_bytes<'py>(
 #[pyfunction]
 #[pyo3(signature = (name, video_data, output_path, encryption_key=None))]
 fn build_usm(
+    py: Python<'_>,
     name: &str,
     video_data: Vec<u8>,
     output_path: &str,
@@ -704,8 +732,7 @@ fn build_usm(
     let mut output = fs::File::create(output_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create output file: {}", e)))?;
 
-    builder
-        .build(&mut output)
+    py.detach(|| builder.build(&mut output))
         .map_err(|e| PyRuntimeError::new_err(format!("USM build failed: {}", e)))?;
 
     Ok(())
@@ -723,6 +750,7 @@ fn build_usm(
 #[pyfunction]
 #[pyo3(signature = (name, video_data, encryption_key=None))]
 fn build_usm_bytes(
+    py: Python<'_>,
     name: &str,
     video_data: Vec<u8>,
     encryption_key: Option<u64>,
@@ -733,12 +761,11 @@ fn build_usm_bytes(
         builder = builder.encryption_key(key);
     }
 
-    let mut output = Cursor::new(Vec::new());
-    builder
-        .build(&mut output)
-        .map_err(|e| PyRuntimeError::new_err(format!("USM build failed: {}", e)))?;
-
-    Ok(output.into_inner())
+    py.detach(|| {
+        let mut output = Cursor::new(Vec::new());
+        builder.build(&mut output).map(|_| output.into_inner())
+    })
+    .map_err(|e| PyRuntimeError::new_err(format!("USM build failed: {}", e)))
 }
 
 /// Read metadata from a USM file.
@@ -749,9 +776,10 @@ fn build_usm_bytes(
 /// Returns:
 ///     Metadata as a JSON string
 #[pyfunction]
-fn read_usm_metadata(usm_path: &str) -> PyResult<String> {
+fn read_usm_metadata(py: Python<'_>, usm_path: &str) -> PyResult<String> {
     let usm_path = Path::new(usm_path);
-    let metadata = usm::read_metadata_file(usm_path)
+    let metadata = py
+        .detach(|| usm::read_metadata_file(usm_path))
         .map_err(|e| PyRuntimeError::new_err(format!("Metadata read failed: {}", e)))?;
 
     serde_json::to_string_pretty(&metadata)
