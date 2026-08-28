@@ -31,7 +31,7 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Generate Rust coverage
-        run: cargo llvm-cov --locked --lcov --output-path target/llvm-cov/lcov.info
+        run: cargo llvm-cov --locked --lcov --output-path target/lcov.info
         env:
           RUST_MIN_STACK: 16777216
 
