@@ -1287,6 +1287,39 @@ mod tests {
     }
 
     #[test]
+    fn test_intensity_and_hfr_helpers() {
+        assert_eq!(quantize_intensity(0.0, 0.0, 0.0), (0, 1.0));
+        let (intensity, ratio) = quantize_intensity(3.0, 1.0, 2.0);
+        assert!((1..=13).contains(&intensity));
+        assert!((0.5..=SQRT_2 / 2.0).contains(&ratio));
+
+        let mut channel = ChannelEncodeState::default();
+        for subframe in 0..HCA_SUBFRAMES {
+            channel.spectra[subframe][126] = 2.0;
+            channel.spectra[subframe][127] = 4.0;
+            channel.scaled_spectra[3][subframe] = 2.0;
+            channel.scaled_spectra[2][subframe] = 4.0;
+        }
+        assert_eq!(hfr_spectra_average(&channel, 126, 4), (3.0, 128));
+        assert_eq!(hfr_spectra_average(&channel, 128, 1), (0.0, 128));
+        assert_eq!(hfr_source_average(&channel, 4, 4, 0, 2), (3.0, 2));
+        assert_eq!(hfr_source_average(&channel, 4, 0, 0, 1), (0.0, 0));
+
+        let mut encoder = HcaEncoder::new(HcaEncoderConfig::new(44100, 2)).unwrap();
+        encoder.hfr_group_count = 2;
+        encoder.bands_per_hfr_group = 1;
+        encoder.channel[0] = channel;
+        encoder.calculate_channel_hfr_averages(0, 126);
+        assert_eq!(
+            encoder.channel[0].hfr_group_average_spectra[..2],
+            [2.0, 4.0]
+        );
+        encoder.calculate_channel_hfr_scale(0, 4, 4);
+        assert!(encoder.channel[0].hfr_scales[0] > 0);
+        assert!(encoder.channel[0].hfr_scales[1] > 0);
+    }
+
+    #[test]
     fn test_invalid_config() {
         let config = HcaEncoderConfig::new(0, 2);
         let encoder = HcaEncoder::new(config);

@@ -1002,6 +1002,81 @@ mod tests {
     }
 
     #[test]
+    fn process_chunk_routes_and_masks_payloads() {
+        let content = lcg_fill(0x300);
+        let (video_mask, audio_mask) = get_mask(TEST_KEY);
+
+        let mut video = Vec::new();
+        process_chunk(
+            &mut Reader::new(std::io::Cursor::new(content.clone())),
+            b"@SFV",
+            content.len(),
+            0,
+            &mut video,
+            &mut None,
+            Some(&video_mask),
+            None,
+        )
+        .unwrap();
+        assert_eq!(video, ref_video(&content, &video_mask));
+
+        let mut audio = Vec::new();
+        let mut audio_target = Some(&mut audio);
+        process_chunk(
+            &mut Reader::new(std::io::Cursor::new(content.clone())),
+            b"@SFA",
+            content.len(),
+            0,
+            &mut Vec::new(),
+            &mut audio_target,
+            None,
+            Some(&audio_mask),
+        )
+        .unwrap();
+        assert_eq!(audio, ref_audio(&content, &audio_mask));
+
+        let mut plain_video = Vec::new();
+        process_chunk(
+            &mut Reader::new(std::io::Cursor::new(content.clone())),
+            b"@SFV",
+            content.len(),
+            1,
+            &mut plain_video,
+            &mut None,
+            Some(&video_mask),
+            None,
+        )
+        .unwrap();
+        assert_eq!(plain_video, content);
+
+        let mut untouched = Vec::new();
+        process_chunk(
+            &mut Reader::new(std::io::Cursor::new(content.clone())),
+            b"OTHER",
+            content.len(),
+            0,
+            &mut untouched,
+            &mut None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(untouched.is_empty());
+
+        process_chunk(
+            &mut Reader::new(std::io::Cursor::new(content.clone())),
+            b"@SFA",
+            content.len(),
+            1,
+            &mut Vec::new(),
+            &mut None,
+            None,
+            Some(&audio_mask),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn mask_golden() {
         // Locks the exact byte output of mask_video/mask_audio so the SIMD/
         // auto-vectorization refactor stays bit-identical. Uses a synthetic key (TEST_KEY).

@@ -1575,6 +1575,82 @@ mod tests {
     }
 
     #[test]
+    fn test_refactored_decoder_helpers() {
+        let mut channel_types = [ChannelType::Discrete; 8];
+        assign_stereo_channel_types(&mut channel_types[..4], 4, 0);
+        assert_eq!(channel_types[0], ChannelType::StereoPrimary);
+        assert_eq!(channel_types[1], ChannelType::StereoSecondary);
+        assert_eq!(channel_types[2], ChannelType::StereoPrimary);
+        assert_eq!(channel_types[3], ChannelType::StereoSecondary);
+        assign_stereo_channel_types(&mut channel_types[..5], 5, 2);
+        assert_eq!(channel_types[3], ChannelType::StereoPrimary);
+        assign_stereo_channel_types(&mut channel_types[..6], 6, 0);
+        assert_eq!(channel_types[4], ChannelType::StereoPrimary);
+        assign_stereo_channel_types(&mut channel_types, 8, 0);
+        assert_eq!(channel_types[6], ChannelType::StereoPrimary);
+
+        assert_eq!(sample_quality(1.5, 32768.0), (1, 0));
+        assert_eq!(sample_quality(0.0, 32768.0), (0, 1));
+        assert_eq!(sample_quality(0.5, 32768.0), (0, 0));
+        assert_eq!(resolution_for_scale_factor(0, 0, 0, 0, 0, 15), 0);
+        assert_eq!(resolution_for_scale_factor(63, 0, 0, 0, 1, 15), 15);
+        assert_eq!(resolution_for_scale_factor(1, 100, 0, 0, 0, 15), 0);
+
+        let mut hca = Box::new(ClHca::new());
+        hca.channels = 1;
+        hca.channel[0].wave[0][0] = 0.5;
+        let mut mono = vec![0; HCA_SAMPLES_PER_FRAME];
+        hca.read_samples_16(&mut mono);
+        assert_eq!(mono[0], pcm_f32_to_i16(0.5));
+
+        hca.channels = 3;
+        hca.channel[0].wave[0][0] = 0.25;
+        hca.channel[1].wave[0][0] = 0.5;
+        hca.channel[2].wave[0][0] = 0.75;
+        let mut interleaved = vec![0; HCA_SAMPLES_PER_FRAME * 3];
+        hca.read_samples_16(&mut interleaved);
+        assert_eq!(interleaved[0], pcm_f32_to_i16(0.25));
+        assert_eq!(interleaved[1], pcm_f32_to_i16(0.5));
+        assert_eq!(interleaved[2], pcm_f32_to_i16(0.75));
+    }
+
+    #[test]
+    fn test_scale_factor_and_intensity_unpack_helpers() {
+        let mut channel = StChannel::default();
+        channel.scale_factors.fill(9);
+        ClHca::unpack_scale_factor_values(&mut channel, &mut BitReader::new(&[]), 2, 0).unwrap();
+        assert!(channel.scale_factors.iter().all(|&value| value == 0));
+
+        let fixed_data = [0b1010_1001, 0b0101_0000];
+        ClHca::unpack_scale_factor_values(&mut channel, &mut BitReader::new(&fixed_data), 2, 6)
+            .unwrap();
+        assert_eq!(&channel.scale_factors[..2], &[42, 21]);
+
+        let mut escaped_reader = BitReader::new(&[0b1010_0000]);
+        assert_eq!(
+            decode_intensity_delta(&mut escaped_reader, 0, 3, 3).unwrap(),
+            10
+        );
+        assert!(decode_intensity_delta(&mut BitReader::new(&[]), 15, 2, 3).is_err());
+
+        let mut channel = StChannel::default();
+        ClHca::unpack_delta_intensity(&mut channel, &mut BitReader::new(&[0xf0])).unwrap();
+        assert!(channel.intensity.iter().all(|&value| value == 7));
+
+        ClHca::unpack_delta_intensity(&mut channel, &mut BitReader::new(&[0x20, 0x00])).unwrap();
+        assert!(channel.intensity.iter().all(|&value| value == 2));
+
+        let mut writer = crate::hca::bitreader::BitWriter::new(8);
+        writer.write(2, 4);
+        writer.write(3, 2);
+        for value in 1..HCA_SUBFRAMES as u32 {
+            writer.write(value, 4);
+        }
+        ClHca::unpack_delta_intensity(&mut channel, &mut BitReader::new(writer.data())).unwrap();
+        assert_eq!(channel.intensity, [2, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
     fn test_deq_used_matches_read_bit_table() {
         use crate::hca::tables::READ_BIT_TABLE;
 
