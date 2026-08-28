@@ -5,9 +5,6 @@ on:
     types: [published]
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 env:
   # Extract version from tag (strips 'v' prefix), fallback to 0.0.0 for workflow_dispatch
   RELEASE_VERSION: ${{ github.event_name == 'release' && github.ref_name || 'v0.0.0' }}
@@ -18,11 +15,13 @@ jobs:
   # ──────────────────────────────────────────────
   linux:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       matrix:
         target: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Set version from tag
         if: github.event_name == 'release'
         run: |
@@ -30,7 +29,7 @@ jobs:
           sed -i "0,/^version = .*/s//version = \"${VERSION}\"/" Cargo.toml
           sed -i "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter
@@ -47,11 +46,13 @@ jobs:
   # ──────────────────────────────────────────────
   macos:
     runs-on: macos-15
+    permissions:
+      contents: read
     strategy:
       matrix:
         target: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Set version from tag
         if: github.event_name == 'release'
         run: |
@@ -70,7 +71,7 @@ jobs:
             3.14t
           allow-prereleases: true
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter
@@ -86,8 +87,10 @@ jobs:
   # ──────────────────────────────────────────────
   windows:
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Set version from tag
         if: github.event_name == 'release'
         shell: bash
@@ -107,7 +110,7 @@ jobs:
             3.14t
           allow-prereleases: true
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           target: x64
           args: --release --out dist --find-interpreter
@@ -123,8 +126,10 @@ jobs:
   # ──────────────────────────────────────────────
   sdist:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Set version from tag
         if: github.event_name == 'release'
         run: |
@@ -132,7 +137,7 @@ jobs:
           sed -i "0,/^version = .*/s//version = \"${VERSION}\"/" Cargo.toml
           sed -i "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
       - name: Build sdist
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: sdist
           args: --out dist
@@ -162,7 +167,7 @@ jobs:
           merge-multiple: true
           path: dist/
       - name: Publish to PyPI
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: upload
           args: --non-interactive --skip-existing dist/*

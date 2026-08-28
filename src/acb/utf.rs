@@ -1,6 +1,11 @@
 //! UTF table parser (CRI's custom table format)
 
-use crate::acb::consts::*;
+use crate::acb::consts::{
+    COLUMN_FLAG_DEFAULT, COLUMN_FLAG_MASK, COLUMN_FLAG_NAME, COLUMN_FLAG_ROW,
+    COLUMN_FLAG_UNDEFINED, COLUMN_TYPE_1BYTE, COLUMN_TYPE_1BYTE2, COLUMN_TYPE_2BYTE,
+    COLUMN_TYPE_2BYTE2, COLUMN_TYPE_4BYTE, COLUMN_TYPE_4BYTE2, COLUMN_TYPE_8BYTE, COLUMN_TYPE_DATA,
+    COLUMN_TYPE_FLOAT, COLUMN_TYPE_MASK, COLUMN_TYPE_STRING,
+};
 use crate::reader::Reader;
 use rustc_hash::FxHashMap;
 use std::io::{Read, Seek, SeekFrom};

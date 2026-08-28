@@ -60,6 +60,29 @@ pub enum ChannelType {
     StereoSecondary,
 }
 
+fn set_stereo_pair(channel_types: &mut [ChannelType], primary: usize) {
+    channel_types[primary] = ChannelType::StereoPrimary;
+    channel_types[primary + 1] = ChannelType::StereoSecondary;
+}
+
+pub(crate) fn assign_stereo_channel_types(
+    channel_types: &mut [ChannelType],
+    channels_per_track: usize,
+    channel_config: u32,
+) {
+    set_stereo_pair(channel_types, 0);
+    match channels_per_track {
+        4 if channel_config == 0 => set_stereo_pair(channel_types, 2),
+        5 if channel_config <= 2 => set_stereo_pair(channel_types, 3),
+        6 | 7 => set_stereo_pair(channel_types, 4),
+        8 => {
+            set_stereo_pair(channel_types, 4);
+            set_stereo_pair(channel_types, 6);
+        }
+        _ => {}
+    }
+}
+
 /// Channel state for decoding
 #[derive(Clone)]
 pub struct StChannel {
@@ -235,6 +258,53 @@ fn header_ceil2(a: u32, b: u32) -> u32 {
         result += 1;
     }
     result
+}
+
+fn sample_quality(sample: f32, scale: f32) -> (i32, i32) {
+    if !(-1.0..=1.0).contains(&sample) {
+        return (1, 0);
+    }
+    let pcm = (sample * scale) as i32;
+    (0, i32::from(pcm == 0 || pcm == -1))
+}
+
+fn decode_intensity_delta(
+    br: &mut BitReader,
+    value: u8,
+    delta: u8,
+    maximum_delta: u8,
+) -> Result<u8, HcaError> {
+    if delta == maximum_delta {
+        return Ok(br.read(4) as u8);
+    }
+    let value = value.wrapping_sub(maximum_delta >> 1).wrapping_add(delta);
+    if value > 15 {
+        return Err(HcaError::UnpackError("invalid intensity".into()));
+    }
+    Ok(value)
+}
+
+fn resolution_for_scale_factor(
+    scale_factor: u8,
+    ath: u8,
+    packed_noise_level: u32,
+    band: usize,
+    minimum: u8,
+    maximum: u8,
+) -> u8 {
+    if scale_factor == 0 {
+        return 0;
+    }
+
+    // clHCA keeps packed_noise_level unsigned: the shift must remain logical.
+    let noise_level = ath as i32 + ((packed_noise_level.wrapping_add(band as u32) >> 8) as i32);
+    let curve_position = noise_level + 1 - ((5 * scale_factor as i32) >> 1);
+    let resolution = match curve_position {
+        ..0 => 15,
+        0..=65 => INVERT_TABLE[curve_position as usize],
+        _ => 0,
+    };
+    resolution.clamp(minimum, maximum)
 }
 
 /// Consumed-bit-count model for `dequantize_coefficients`: every
@@ -706,74 +776,13 @@ impl ClHca {
 
     fn init_channels(&mut self) -> Result<(), HcaError> {
         let mut channel_types = [ChannelType::Discrete; HCA_MAX_CHANNELS];
-        let channels_per_track = self.channels / self.track_count;
+        let channels_per_track = (self.channels / self.track_count) as usize;
 
         if self.stereo_band_count > 0 && channels_per_track > 1 {
             for i in 0..self.track_count as usize {
-                let ct = &mut channel_types[i * channels_per_track as usize..];
-
-                match channels_per_track {
-                    2 => {
-                        ct[0] = ChannelType::StereoPrimary;
-                        ct[1] = ChannelType::StereoSecondary;
-                    }
-                    3 => {
-                        ct[0] = ChannelType::StereoPrimary;
-                        ct[1] = ChannelType::StereoSecondary;
-                        ct[2] = ChannelType::Discrete;
-                    }
-                    4 => {
-                        ct[0] = ChannelType::StereoPrimary;
-                        ct[1] = ChannelType::StereoSecondary;
-                        if self.channel_config == 0 {
-                            ct[2] = ChannelType::StereoPrimary;
-                            ct[3] = ChannelType::StereoSecondary;
-                        } else {
-                            ct[2] = ChannelType::Discrete;
-                            ct[3] = ChannelType::Discrete;
-                        }
-                    }
-                    5 => {
-                        ct[0] = ChannelType::StereoPrimary;
-                        ct[1] = ChannelType::StereoSecondary;
-                        ct[2] = ChannelType::Discrete;
-                        if self.channel_config <= 2 {
-                            ct[3] = ChannelType::StereoPrimary;
-                            ct[4] = ChannelType::StereoSecondary;
-                        } else {
-                            ct[3] = ChannelType::Discrete;
-                            ct[4] = ChannelType::Discrete;
-                        }
-                    }
-                    6 => {
-                        ct[0] = ChannelType::StereoPrimary;
-                        ct[1] = ChannelType::StereoSecondary;
-                        ct[2] = ChannelType::Discrete;
-                        ct[3] = ChannelType::Discrete;
-                        ct[4] = ChannelType::StereoPrimary;
-                        ct[5] = ChannelType::StereoSecondary;
-                    }
-                    7 => {
-                        ct[0] = ChannelType::StereoPrimary;
-                        ct[1] = ChannelType::StereoSecondary;
-                        ct[2] = ChannelType::Discrete;
-                        ct[3] = ChannelType::Discrete;
-                        ct[4] = ChannelType::StereoPrimary;
-                        ct[5] = ChannelType::StereoSecondary;
-                        ct[6] = ChannelType::Discrete;
-                    }
-                    8 => {
-                        ct[0] = ChannelType::StereoPrimary;
-                        ct[1] = ChannelType::StereoSecondary;
-                        ct[2] = ChannelType::Discrete;
-                        ct[3] = ChannelType::Discrete;
-                        ct[4] = ChannelType::StereoPrimary;
-                        ct[5] = ChannelType::StereoSecondary;
-                        ct[6] = ChannelType::StereoPrimary;
-                        ct[7] = ChannelType::StereoSecondary;
-                    }
-                    _ => {}
-                }
+                let start = i * channels_per_track;
+                let track_types = &mut channel_types[start..start + channels_per_track];
+                assign_stereo_channel_types(track_types, channels_per_track, self.channel_config);
             }
         }
 
@@ -808,40 +817,44 @@ impl ClHca {
         }
     }
 
+    fn read_mono_samples_16(&self, samples: &mut [i16]) {
+        for subframe in 0..HCA_SUBFRAMES {
+            let base = subframe * HCA_SAMPLES_PER_SUBFRAME;
+            for sample in 0..HCA_SAMPLES_PER_SUBFRAME {
+                samples[base + sample] = pcm_f32_to_i16(self.channel[0].wave[subframe][sample]);
+            }
+        }
+    }
+
+    fn read_stereo_samples_16(&self, samples: &mut [i16]) {
+        for subframe in 0..HCA_SUBFRAMES {
+            let base = subframe * HCA_SAMPLES_PER_SUBFRAME * 2;
+            for sample in 0..HCA_SAMPLES_PER_SUBFRAME {
+                let output = base + sample * 2;
+                samples[output] = pcm_f32_to_i16(self.channel[0].wave[subframe][sample]);
+                samples[output + 1] = pcm_f32_to_i16(self.channel[1].wave[subframe][sample]);
+            }
+        }
+    }
+
+    fn read_interleaved_samples_16(&self, samples: &mut [i16], channels: usize) {
+        let mut output = 0;
+        for subframe in 0..HCA_SUBFRAMES {
+            for sample in 0..HCA_SAMPLES_PER_SUBFRAME {
+                for channel in self.channel.iter().take(channels) {
+                    samples[output] = pcm_f32_to_i16(channel.wave[subframe][sample]);
+                    output += 1;
+                }
+            }
+        }
+    }
+
     /// Read decoded samples as 16-bit PCM
     pub fn read_samples_16(&self, samples: &mut [i16]) {
-        let channels = self.channels as usize;
-
-        match channels {
-            1 => {
-                for i in 0..HCA_SUBFRAMES {
-                    let base = i * HCA_SAMPLES_PER_SUBFRAME;
-                    for j in 0..HCA_SAMPLES_PER_SUBFRAME {
-                        samples[base + j] = pcm_f32_to_i16(self.channel[0].wave[i][j]);
-                    }
-                }
-            }
-            2 => {
-                for i in 0..HCA_SUBFRAMES {
-                    let base = i * HCA_SAMPLES_PER_SUBFRAME * 2;
-                    for j in 0..HCA_SAMPLES_PER_SUBFRAME {
-                        let idx = base + j * 2;
-                        samples[idx] = pcm_f32_to_i16(self.channel[0].wave[i][j]);
-                        samples[idx + 1] = pcm_f32_to_i16(self.channel[1].wave[i][j]);
-                    }
-                }
-            }
-            _ => {
-                let mut idx = 0;
-                for i in 0..HCA_SUBFRAMES {
-                    for j in 0..HCA_SAMPLES_PER_SUBFRAME {
-                        for k in 0..channels {
-                            samples[idx] = pcm_f32_to_i16(self.channel[k].wave[i][j]);
-                            idx += 1;
-                        }
-                    }
-                }
-            }
+        match self.channels as usize {
+            1 => self.read_mono_samples_16(samples),
+            2 => self.read_stereo_samples_16(samples),
+            channels => self.read_interleaved_samples_16(samples, channels),
         }
     }
 
@@ -931,16 +944,10 @@ impl ClHca {
             for sf in 0..HCA_SUBFRAMES {
                 for s in 0..HCA_SAMPLES_PER_SUBFRAME {
                     let fsample = self.channel[ch].wave[sf][s];
-
-                    if !(-1.0..=1.0).contains(&fsample) {
-                        clips += 1;
-                    } else {
-                        let psample = (fsample * SCALE) as i32;
-                        if psample == 0 || psample == -1 {
-                            blanks += 1;
-                            *channel_blank += 1;
-                        }
-                    }
+                    let (sample_clips, sample_blanks) = sample_quality(fsample, SCALE);
+                    clips += sample_clips;
+                    blanks += sample_blanks;
+                    *channel_blank += sample_blanks;
                 }
             }
         }
@@ -1013,30 +1020,39 @@ impl ClHca {
         let full = self.bands_per_hfr_group != 0 || self.stereo_band_count != 0;
         for subframe in 0..HCA_SUBFRAMES {
             if full {
-                for ch in 0..channels {
-                    self.reconstruct_high_frequency(ch, subframe);
-                }
-                if self.stereo_band_count > 0 {
-                    for ch in 0..channels.saturating_sub(1) {
-                        self.apply_intensity_stereo(ch, subframe);
-                        self.apply_ms_stereo(ch, subframe);
-                    }
-                }
+                self.restore_dct_bands(subframe, channels);
             }
-            for (ch, chunk) in out
-                .as_chunks_mut::<HCA_SAMPLES_PER_FRAME>()
-                .0
-                .iter_mut()
-                .enumerate()
-                .take(channels)
-            {
-                crate::hca::imdct::imdct_dct(&mut self.channel[ch], subframe);
-                chunk[subframe * HCA_SAMPLES_PER_SUBFRAME
-                    ..(subframe + 1) * HCA_SAMPLES_PER_SUBFRAME]
-                    .copy_from_slice(&self.channel[ch].spectra[subframe]);
-            }
+            self.write_dct_subframe(subframe, channels, out);
         }
         Ok(())
+    }
+
+    fn restore_dct_bands(&mut self, subframe: usize, channels: usize) {
+        for channel in 0..channels {
+            self.reconstruct_high_frequency(channel, subframe);
+        }
+        if self.stereo_band_count == 0 {
+            return;
+        }
+        for channel in 0..channels.saturating_sub(1) {
+            self.apply_intensity_stereo(channel, subframe);
+            self.apply_ms_stereo(channel, subframe);
+        }
+    }
+
+    fn write_dct_subframe(&mut self, subframe: usize, channels: usize, out: &mut [f32]) {
+        for (channel, chunk) in out
+            .as_chunks_mut::<HCA_SAMPLES_PER_FRAME>()
+            .0
+            .iter_mut()
+            .enumerate()
+            .take(channels)
+        {
+            crate::hca::imdct::imdct_dct(&mut self.channel[channel], subframe);
+            let start = subframe * HCA_SAMPLES_PER_SUBFRAME;
+            chunk[start..start + HCA_SAMPLES_PER_SUBFRAME]
+                .copy_from_slice(&self.channel[channel].spectra[subframe]);
+        }
     }
 
     fn decode_block_unpack(&mut self, data: &mut [u8]) -> Result<usize, HcaError> {
@@ -1094,10 +1110,7 @@ impl ClHca {
         let mut cs_count = channel.coded_count;
         let extra_count: usize;
 
-        // Register-resident accumulator (see BitAcc): the delta decode below
-        // otherwise pays BitReader's per-read reload for every coefficient.
-        let mut acc = br.acc();
-        let delta_bits = acc.read(3) as u8;
+        let delta_bits = br.read(3) as u8;
 
         if channel.channel_type == ChannelType::StereoSecondary
             || self.hfr_group_count == 0
@@ -1113,39 +1126,7 @@ impl ClHca {
             }
         }
 
-        if delta_bits >= 6 {
-            // Fixed scale factors
-            for i in 0..cs_count {
-                channel.scale_factors[i] = acc.read(6) as u8;
-            }
-        } else if delta_bits > 0 {
-            // Delta scale factors
-            let expected_delta = ((1 << delta_bits) - 1) as u8;
-            let mut value = acc.read(6) as u8;
-
-            channel.scale_factors[0] = value;
-            for i in 1..cs_count {
-                let delta = acc.read(delta_bits as u32) as u8;
-
-                if delta == expected_delta {
-                    value = acc.read(6) as u8;
-                } else {
-                    let scalefactor_test =
-                        value as i32 + (delta as i32 - (expected_delta >> 1) as i32);
-                    if !(0..64).contains(&scalefactor_test) {
-                        return Err(HcaError::UnpackError("invalid scalefactor".into()));
-                    }
-
-                    value = value.wrapping_sub(expected_delta >> 1).wrapping_add(delta);
-                    value &= 0x3F;
-                }
-                channel.scale_factors[i] = value;
-            }
-        } else {
-            // No scale factors
-            channel.scale_factors[..HCA_SAMPLES_PER_SUBFRAME].fill(0);
-        }
-        acc.sync(br);
+        Self::unpack_scale_factor_values(channel, br, cs_count, delta_bits)?;
 
         // Set derived HFR scales for v3.0
         for i in 0..extra_count {
@@ -1156,67 +1137,106 @@ impl ClHca {
         Ok(())
     }
 
+    fn unpack_scale_factor_values(
+        channel: &mut StChannel,
+        br: &mut BitReader,
+        count: usize,
+        delta_bits: u8,
+    ) -> Result<(), HcaError> {
+        if delta_bits == 0 {
+            channel.scale_factors.fill(0);
+            return Ok(());
+        }
+
+        let mut acc = br.acc();
+        if delta_bits >= 6 {
+            for entry in channel.scale_factors.iter_mut().take(count) {
+                *entry = acc.read(6) as u8;
+            }
+            acc.sync(br);
+            return Ok(());
+        }
+
+        let expected_delta = ((1 << delta_bits) - 1) as u8;
+        let mut value = acc.read(6) as u8;
+        channel.scale_factors[0] = value;
+        for entry in channel.scale_factors.iter_mut().take(count).skip(1) {
+            let delta = acc.read(delta_bits as u32) as u8;
+            if delta == expected_delta {
+                value = acc.read(6) as u8;
+            } else {
+                let candidate = value as i32 + delta as i32 - (expected_delta >> 1) as i32;
+                if !(0..64).contains(&candidate) {
+                    return Err(HcaError::UnpackError("invalid scalefactor".into()));
+                }
+                value = value.wrapping_sub(expected_delta >> 1).wrapping_add(delta) & 0x3f;
+            }
+            *entry = value;
+        }
+        acc.sync(br);
+        Ok(())
+    }
+
     fn unpack_intensity(&mut self, ch: usize, br: &mut BitReader) -> Result<(), HcaError> {
         let channel = &mut self.channel[ch];
 
         if channel.channel_type == ChannelType::StereoSecondary {
             if self.version <= HCA_VERSION_200 {
-                let value = br.peek(4) as u8;
-
-                channel.intensity[0] = value;
-                if value < 15 {
-                    br.skip(4);
-                    for i in 1..HCA_SUBFRAMES {
-                        channel.intensity[i] = br.read(4) as u8;
-                    }
-                }
+                Self::unpack_legacy_intensity(channel, br);
             } else {
-                let value = br.peek(4) as u8;
-
-                if value < 15 {
-                    br.skip(4);
-
-                    let delta_bits = br.read(2) as u8;
-
-                    channel.intensity[0] = value;
-                    if delta_bits == 3 {
-                        // Fixed intensities
-                        for i in 1..HCA_SUBFRAMES {
-                            channel.intensity[i] = br.read(4) as u8;
-                        }
-                    } else {
-                        // Delta intensities
-                        let bmax = ((2 << delta_bits) - 1) as u8;
-                        let bits = delta_bits + 1;
-                        let mut value = value;
-
-                        for i in 1..HCA_SUBFRAMES {
-                            let delta = br.read(bits as usize) as u8;
-                            if delta == bmax {
-                                value = br.read(4) as u8;
-                            } else {
-                                value = value.wrapping_sub(bmax >> 1).wrapping_add(delta);
-                                if value > 15 {
-                                    return Err(HcaError::UnpackError("invalid intensity".into()));
-                                }
-                            }
-
-                            channel.intensity[i] = value;
-                        }
-                    }
-                } else {
-                    br.skip(4);
-                    channel.intensity.fill(7);
-                }
+                Self::unpack_delta_intensity(channel, br)?;
             }
         } else if self.version <= HCA_VERSION_200 {
-            let hfr_scales = &mut channel.scale_factors[128 - self.hfr_group_count as usize..];
-            for entry in hfr_scales.iter_mut().take(self.hfr_group_count as usize) {
-                *entry = br.read(6) as u8;
-            }
+            Self::unpack_hfr_scales(channel, br, self.hfr_group_count as usize);
         }
 
         Ok(())
+    }
+
+    fn unpack_legacy_intensity(channel: &mut StChannel, br: &mut BitReader) {
+        let value = br.peek(4) as u8;
+        channel.intensity[0] = value;
+        if value >= 15 {
+            return;
+        }
+        br.skip(4);
+        for entry in channel.intensity.iter_mut().skip(1) {
+            *entry = br.read(4) as u8;
+        }
+    }
+
+    fn unpack_delta_intensity(channel: &mut StChannel, br: &mut BitReader) -> Result<(), HcaError> {
+        let mut value = br.peek(4) as u8;
+        if value >= 15 {
+            br.skip(4);
+            channel.intensity.fill(7);
+            return Ok(());
+        }
+
+        br.skip(4);
+        let delta_bits = br.read(2) as u8;
+        channel.intensity[0] = value;
+        if delta_bits == 3 {
+            for entry in channel.intensity.iter_mut().skip(1) {
+                *entry = br.read(4) as u8;
+            }
+            return Ok(());
+        }
+
+        let maximum_delta = ((2 << delta_bits) - 1) as u8;
+        for entry in channel.intensity.iter_mut().skip(1) {
+            let delta = br.read((delta_bits + 1) as usize) as u8;
+            value = decode_intensity_delta(br, value, delta, maximum_delta)?;
+            *entry = value;
+        }
+        Ok(())
+    }
+
+    fn unpack_hfr_scales(channel: &mut StChannel, br: &mut BitReader, count: usize) {
+        let hfr_scales = &mut channel.scale_factors[HCA_SAMPLES_PER_SUBFRAME - count..];
+        for entry in hfr_scales {
+            *entry = br.read(6) as u8;
+        }
     }
 
     fn calculate_resolution(&mut self, ch: usize, packed_noise_level: u32) {
@@ -1227,31 +1247,17 @@ impl ClHca {
 
         for i in 0..cr_count {
             let scalefactor = channel.scale_factors[i];
-            let mut new_resolution = 0u8;
+            let new_resolution = resolution_for_scale_factor(
+                scalefactor,
+                self.ath_curve[i],
+                packed_noise_level,
+                i,
+                self.min_resolution as u8,
+                self.max_resolution as u8,
+            );
 
             if scalefactor > 0 {
-                // clHCA keeps packed_noise_level unsigned: (packed_noise_level + i) >> 8 is a
-                // logical shift (hca.cpp:1456). Casting to i32 before >>8 made it arithmetic,
-                // diverging when frame_acceptable_noise_level==0 wraps the high bit on.
-                let noise_level = self.ath_curve[i] as i32
-                    + ((packed_noise_level.wrapping_add(i as u32) >> 8) as i32);
-                let curve_position = noise_level + 1 - ((5 * scalefactor as i32) >> 1);
-
-                if curve_position < 0 {
-                    new_resolution = 15;
-                } else if curve_position <= 65 {
-                    new_resolution = INVERT_TABLE[curve_position as usize];
-                } else {
-                    new_resolution = 0;
-                }
-
-                if new_resolution > self.max_resolution as u8 {
-                    new_resolution = self.max_resolution as u8;
-                } else if new_resolution < self.min_resolution as u8 {
-                    new_resolution = self.min_resolution as u8;
-                }
-
-                if new_resolution < 1 {
+                if new_resolution == 0 {
                     channel.noises[noise_count] = i as u8;
                     noise_count += 1;
                 } else {
@@ -1364,32 +1370,34 @@ impl ClHca {
     fn decode_block_transform(&mut self) {
         if self.min_resolution > 0 && self.bands_per_hfr_group == 0 && self.stereo_band_count == 0 {
             for subframe in 0..HCA_SUBFRAMES {
-                for ch in 0..self.channels as usize {
-                    imdct_transform(&mut self.channel[ch], subframe);
-                }
+                self.transform_channels(subframe);
             }
             return;
         }
 
         for subframe in 0..HCA_SUBFRAMES {
-            // Restore missing bands
-            for ch in 0..self.channels as usize {
-                self.reconstruct_noise(ch, subframe);
-                self.reconstruct_high_frequency(ch, subframe);
-            }
+            self.restore_transform_bands(subframe);
+            self.transform_channels(subframe);
+        }
+    }
 
-            // Restore joint stereo bands
-            if self.stereo_band_count > 0 {
-                for ch in 0..(self.channels as usize).saturating_sub(1) {
-                    self.apply_intensity_stereo(ch, subframe);
-                    self.apply_ms_stereo(ch, subframe);
-                }
-            }
+    fn restore_transform_bands(&mut self, subframe: usize) {
+        for channel in 0..self.channels as usize {
+            self.reconstruct_noise(channel, subframe);
+            self.reconstruct_high_frequency(channel, subframe);
+        }
+        if self.stereo_band_count == 0 {
+            return;
+        }
+        for channel in 0..(self.channels as usize).saturating_sub(1) {
+            self.apply_intensity_stereo(channel, subframe);
+            self.apply_ms_stereo(channel, subframe);
+        }
+    }
 
-            // Apply IMDCT
-            for ch in 0..self.channels as usize {
-                imdct_transform(&mut self.channel[ch], subframe);
-            }
+    fn transform_channels(&mut self, subframe: usize) {
+        for channel in self.channel.iter_mut().take(self.channels as usize) {
+            imdct_transform(channel, subframe);
         }
     }
 

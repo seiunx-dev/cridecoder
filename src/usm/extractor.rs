@@ -451,7 +451,7 @@ pub fn extract_usm_to_memory<R: Read + Seek>(
     let decoded_filename = decode_shift_jis(&filename);
     let base_name = Path::new(&decoded_filename)
         .file_stem()
-        .and_then(|s| s.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .unwrap_or(&decoded_filename)
         .to_string();
 
@@ -613,7 +613,7 @@ fn create_output_files(
 ) -> Result<(File, Option<File>, Vec<PathBuf>), UsmError> {
     let base_name = Path::new(decoded_filename)
         .file_stem()
-        .and_then(|s| s.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .unwrap_or(decoded_filename);
 
     let video_path = target_dir.join(format!("{}.{}", base_name, video_ext(mpeg_codec)));
@@ -788,34 +788,56 @@ fn process_chunk<R: Read + Seek, W: Write>(
     vmask: Option<&VideoMask>,
     amask: Option<&AudioMask>,
 ) -> Result<(), UsmError> {
-    if sig == b"@SFV" {
-        if data_type == 0 {
-            if let Some(vmask) = vmask {
-                let mut content = reader.read_bytes(read_data_len)?;
-                mask_video(&mut content, vmask);
-                video_file.write_all(&content)?;
-            } else {
-                reader.copy_to_writer(read_data_len as u64, video_file)?;
-            }
-        } else {
-            reader.copy_to_writer(read_data_len as u64, video_file)?;
-        }
-    } else if sig == b"@SFA" {
-        if let Some(audio_file) = audio_file {
-            if data_type == 0 {
-                if let Some(amask) = amask {
-                    let mut content = reader.read_bytes(read_data_len)?;
-                    mask_audio(&mut content, amask);
-                    audio_file.write_all(&content)?;
-                } else {
-                    reader.copy_to_writer(read_data_len as u64, audio_file)?;
-                }
-            } else {
-                reader.copy_to_writer(read_data_len as u64, audio_file)?;
+    match sig {
+        b"@SFV" => write_video_chunk(reader, read_data_len, data_type, video_file, vmask)?,
+        b"@SFA" => {
+            if let Some(audio_file) = audio_file {
+                write_audio_chunk(reader, read_data_len, data_type, audio_file, amask)?;
             }
         }
+        _ => {}
     }
 
+    Ok(())
+}
+
+fn write_video_chunk<R: Read + Seek, W: Write>(
+    reader: &mut Reader<R>,
+    length: usize,
+    data_type: u8,
+    writer: &mut W,
+    mask: Option<&VideoMask>,
+) -> Result<(), UsmError> {
+    match (data_type, mask) {
+        (0, Some(mask)) => {
+            let mut content = reader.read_bytes(length)?;
+            mask_video(&mut content, mask);
+            writer.write_all(&content)?;
+        }
+        _ => {
+            reader.copy_to_writer(length as u64, writer)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_audio_chunk<R: Read + Seek, W: Write>(
+    reader: &mut Reader<R>,
+    length: usize,
+    data_type: u8,
+    writer: &mut W,
+    mask: Option<&AudioMask>,
+) -> Result<(), UsmError> {
+    match (data_type, mask) {
+        (0, Some(mask)) => {
+            let mut content = reader.read_bytes(length)?;
+            mask_audio(&mut content, mask);
+            writer.write_all(&content)?;
+        }
+        _ => {
+            reader.copy_to_writer(length as u64, writer)?;
+        }
+    }
     Ok(())
 }
 
@@ -829,7 +851,7 @@ pub fn extract_usm_file(
     let file = File::open(usm_path)?;
     let fallback_name = usm_path
         .file_name()
-        .and_then(|s| s.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .map(|s| s.as_bytes().to_vec())
         .unwrap_or_default();
     extract_usm(file, target_dir, &fallback_name, key, export_audio)

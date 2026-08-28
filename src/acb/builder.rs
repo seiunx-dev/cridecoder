@@ -1,6 +1,11 @@
 //! ACB/AWB encoder - builds CRI audio containers from audio files
 
-use crate::acb::consts::*;
+use crate::acb::consts::{
+    COLUMN_FLAG_DEFAULT, COLUMN_FLAG_NAME, COLUMN_FLAG_ROW, COLUMN_TYPE_1BYTE, COLUMN_TYPE_1BYTE2,
+    COLUMN_TYPE_2BYTE, COLUMN_TYPE_2BYTE2, COLUMN_TYPE_4BYTE, COLUMN_TYPE_4BYTE2,
+    COLUMN_TYPE_8BYTE, COLUMN_TYPE_DATA, COLUMN_TYPE_FLOAT, COLUMN_TYPE_STRING,
+    WAVEFORM_ENCODE_TYPE_ADX, WAVEFORM_ENCODE_TYPE_HCA,
+};
 use crate::acb::utf::Value;
 use encoding_rs::SHIFT_JIS;
 use std::collections::{HashMap, HashSet};
@@ -289,6 +294,115 @@ impl UtfTableBuilder {
         result
     }
 
+    fn add_value_to_tables(
+        value: &Value,
+        string_table: &mut StringTable,
+        data_table: &mut DataTable,
+    ) -> Option<(u32, u32)> {
+        match value {
+            Value::String(value) => Some((string_table.add(value), 0)),
+            Value::Data(value) if !value.is_empty() => {
+                Some((data_table.add(value), value.len() as u32))
+            }
+            _ => None,
+        }
+    }
+
+    fn collect_column_data(
+        &self,
+        string_table: &mut StringTable,
+        data_table: &mut DataTable,
+    ) -> (Vec<u32>, Vec<Option<(u32, u32)>>) {
+        let mut names = Vec::with_capacity(self.columns.len());
+        let mut values = Vec::with_capacity(self.columns.len());
+        for column in &self.columns {
+            names.push(string_table.add(&column.name));
+            values.push(
+                column
+                    .constant_value
+                    .as_ref()
+                    .and_then(|value| Self::add_value_to_tables(value, string_table, data_table)),
+            );
+        }
+        (names, values)
+    }
+
+    fn collect_row_data(
+        &self,
+        string_table: &mut StringTable,
+        data_table: &mut DataTable,
+    ) -> Vec<HashMap<String, (u32, u32)>> {
+        let mut rows = Vec::with_capacity(self.rows.len());
+        for row in &self.rows {
+            let mut offsets = HashMap::new();
+            for column in self
+                .columns
+                .iter()
+                .filter(|column| column.constant_value.is_none())
+            {
+                let Some(offset) = row
+                    .get(&column.name)
+                    .and_then(|value| Self::add_value_to_tables(value, string_table, data_table))
+                else {
+                    continue;
+                };
+                offsets.insert(column.name.clone(), offset);
+            }
+            rows.push(offsets);
+        }
+        rows
+    }
+
+    fn schema_size(&self) -> u32 {
+        self.columns
+            .iter()
+            .map(|column| {
+                5 + column
+                    .constant_value
+                    .as_ref()
+                    .map_or(0, |_| Self::value_size(column.typ))
+            })
+            .sum()
+    }
+
+    fn write_schema<W: Write>(
+        &self,
+        writer: &mut W,
+        column_name_offsets: &[u32],
+        constant_offsets: &[Option<(u32, u32)>],
+    ) -> Result<(), BuilderError> {
+        for (index, column) in self.columns.iter().enumerate() {
+            writer.write_all(&[column.flag | column.typ])?;
+            write_u32_be(writer, column_name_offsets[index])?;
+            if let Some(value) = &column.constant_value {
+                self.write_value(writer, value, &constant_offsets[index])?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_rows<W: Write>(
+        &self,
+        writer: &mut W,
+        row_offsets: &[HashMap<String, (u32, u32)>],
+    ) -> Result<(), BuilderError> {
+        for (row_index, row) in self.rows.iter().enumerate() {
+            for column in self
+                .columns
+                .iter()
+                .filter(|column| column.constant_value.is_none())
+            {
+                if let Some(value) = row.get(&column.name) {
+                    let offset = row_offsets[row_index].get(&column.name).copied();
+                    self.write_value(writer, value, &offset)?;
+                } else {
+                    self.write_default(writer, column.typ)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Build the UTF table and write to output
     pub fn build<W: Write + Seek>(&self, writer: &mut W) -> Result<(), BuilderError> {
         // Phase 1: Collect all strings and data blobs
@@ -298,66 +412,13 @@ impl UtfTableBuilder {
         // Add table name
         let table_name_offset = string_table.add_table_name(&self.table_name);
 
-        // Add column names and constant strings/data
-        let mut column_name_offsets = Vec::new();
-        let mut constant_offsets: Vec<Option<(u32, u32)>> = Vec::new();
-
-        for col in &self.columns {
-            column_name_offsets.push(string_table.add(&col.name));
-
-            if let Some(ref val) = col.constant_value {
-                match val {
-                    Value::String(s) => {
-                        let off = string_table.add(s);
-                        constant_offsets.push(Some((off, 0)));
-                    }
-                    Value::Data(d) if !d.is_empty() => {
-                        let off = data_table.add(d);
-                        constant_offsets.push(Some((off, d.len() as u32)));
-                    }
-                    Value::Data(_) => constant_offsets.push(None),
-                    _ => constant_offsets.push(None),
-                }
-            } else {
-                constant_offsets.push(None);
-            }
-        }
-
-        // Add row strings/data
-        let mut row_string_data_offsets: Vec<HashMap<String, (u32, u32)>> = Vec::new();
-        for row in &self.rows {
-            let mut offsets = HashMap::new();
-            for col in &self.columns {
-                if col.constant_value.is_some() {
-                    continue;
-                }
-                if let Some(val) = row.get(&col.name) {
-                    match val {
-                        Value::String(s) => {
-                            let off = string_table.add(s);
-                            offsets.insert(col.name.clone(), (off, 0));
-                        }
-                        Value::Data(d) if !d.is_empty() => {
-                            let off = data_table.add(d);
-                            offsets.insert(col.name.clone(), (off, d.len() as u32));
-                        }
-                        Value::Data(_) => {}
-                        _ => {}
-                    }
-                }
-            }
-            row_string_data_offsets.push(offsets);
-        }
+        let (column_name_offsets, constant_offsets) =
+            self.collect_column_data(&mut string_table, &mut data_table);
+        let row_string_data_offsets = self.collect_row_data(&mut string_table, &mut data_table);
 
         // Phase 2: Calculate sizes and offsets
         // Schema size: for each column, 1 byte (flag|type) + 4 bytes (name offset) + optional constant value
-        let mut schema_size: u32 = 0;
-        for col in &self.columns {
-            schema_size += 5; // flag|type (1) + name offset (4)
-            if col.constant_value.is_some() {
-                schema_size += Self::value_size(col.typ);
-            }
-        }
+        let schema_size = self.schema_size();
 
         // Row size: sum of per-row column sizes
         let row_width: u32 = self
@@ -391,32 +452,10 @@ impl UtfTableBuilder {
         write_u32_be(writer, self.rows.len() as u32)?; // number of rows
 
         // Phase 4: Write schema
-        for (i, col) in self.columns.iter().enumerate() {
-            let info = col.flag | col.typ;
-            writer.write_all(&[info])?;
-            write_u32_be(writer, column_name_offsets[i])?;
-
-            // Write constant value if present
-            if let Some(ref val) = col.constant_value {
-                self.write_value(writer, val, &constant_offsets[i])?;
-            }
-        }
+        self.write_schema(writer, &column_name_offsets, &constant_offsets)?;
 
         // Phase 5: Write rows
-        for (row_idx, row) in self.rows.iter().enumerate() {
-            for col in &self.columns {
-                if col.constant_value.is_some() {
-                    continue;
-                }
-                if let Some(val) = row.get(&col.name) {
-                    let offset_pair = row_string_data_offsets[row_idx].get(&col.name);
-                    self.write_value(writer, val, &offset_pair.cloned())?;
-                } else {
-                    // Write zero/default for missing values
-                    self.write_default(writer, col.typ)?;
-                }
-            }
-        }
+        self.write_rows(writer, &row_string_data_offsets)?;
 
         // Phase 6: Write string table
         writer.write_all(string_table.data())?;

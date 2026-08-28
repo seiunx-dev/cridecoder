@@ -5,11 +5,11 @@ use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let hca_file = args.get(1).map(|s| s.as_str()).unwrap_or("music_5031.hca");
+    let hca_file = args.get(1).map(String::as_str).unwrap_or("music_5031.hca");
     let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(50);
     let threads: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
         std::thread::available_parallelism()
-            .map(|n| n.get())
+            .map(std::num::NonZeroUsize::get)
             .unwrap_or(1)
     });
 

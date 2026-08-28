@@ -363,7 +363,7 @@ fn resolve_threads(threads: Option<usize>) -> usize {
     match threads {
         None => 1,
         Some(0) => std::thread::available_parallelism()
-            .map(|n| n.get())
+            .map(std::num::NonZeroUsize::get)
             .unwrap_or(1),
         Some(n) => n,
     }

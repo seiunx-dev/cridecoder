@@ -4,12 +4,18 @@ use super::decoder::{StChannel, HCA_SAMPLES_PER_SUBFRAME};
 use super::tables::IMDCT_WINDOW;
 
 #[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::*;
+use std::arch::aarch64::{
+    vaddq_f32, vextq_f32, vld1q_f32, vld2q_f32, vmulq_f32, vrev64q_f32, vst1q_f32, vsubq_f32,
+};
 
 // x86_64 guarantees SSE2 in its baseline, so these are usable without a
 // target_feature gate and run on every x86_64 CI target (Linux/macOS/Windows).
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
+use std::arch::x86_64::{
+    _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_permutevar8x32_ps, _mm256_set_epi32,
+    _mm256_shuffle_ps, _mm256_storeu_ps, _mm256_sub_ps, _mm_add_ps, _mm_loadu_ps, _mm_mul_ps,
+    _mm_shuffle_ps, _mm_storeu_ps, _mm_sub_ps,
+};
 
 const HALF: usize = HCA_SAMPLES_PER_SUBFRAME / 2;
 

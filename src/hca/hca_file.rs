@@ -2,6 +2,8 @@
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
 
 pub use super::decoder::HcaInfo;
 use super::decoder::{pcm_f32_to_i16, ClHca, HcaError, HCA_SUBFRAMES};
@@ -478,8 +480,6 @@ impl<R: Read + Seek> HcaDecoder<R> {
         w: &mut W,
         threads: usize,
     ) -> Result<(), HcaDecoderError> {
-        use std::collections::BTreeMap;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::mpsc::sync_channel;
 
         if threads <= 1 || !self.handle.is_block_parallelizable() {
@@ -492,8 +492,6 @@ impl<R: Read + Seek> HcaDecoder<R> {
         let samples_per_block = self.info.samples_per_block;
         let block_size = self.info.block_size as usize;
         let block_count = self.info.block_count as usize;
-        let frame_f32 = channels * samples_per_block;
-
         let total_valid = self.total_valid_samples();
         let total_pcm_bytes = total_valid as usize * channels * 2;
         let smpl_chunk = self.loop_smpl_chunk();
@@ -534,65 +532,25 @@ impl<R: Read + Seek> HcaDecoder<R> {
                     .name("hca-decode".into())
                     .stack_size(8 << 20)
                     .spawn_scoped(scope, move || {
-                        let mut block = vec![0u8; block_size];
-                        let mut dct = vec![0f32; frame_f32];
-                        let mut prev = vec![[0f32; 128]; channels];
-                        let mut wave = [0f32; 128];
-                        let mut pcm = vec![0i16; frame_f32];
-                        let mut scratch = vec![0u8; frame_f32 * 2];
-                        loop {
-                            let c = next_chunk.fetch_add(1, Ordering::Relaxed);
-                            if c >= num_chunks {
-                                break;
-                            }
-                            let lo = c * CHUNK_BLOCKS;
-                            let hi = (lo + CHUNK_BLOCKS).min(block_count);
-                            let payload = decode_chunk_pcm(DecodeChunkArgs {
-                                hca: &mut hca,
-                                data,
-                                lo,
-                                hi,
-                                block_size,
-                                channels,
-                                samples_per_block,
-                                delay,
-                                total_valid,
-                                block: &mut block,
-                                dct: &mut dct,
-                                prev: &mut prev,
-                                wave: &mut wave,
-                                pcm: &mut pcm,
-                                scratch: &mut scratch,
-                            });
-                            if tx.send((c, payload)).is_err() {
-                                break; // writer bailed out
-                            }
-                        }
+                        run_decode_worker(DecodeWorkerArgs {
+                            hca: &mut hca,
+                            data,
+                            next_chunk,
+                            tx,
+                            chunk_blocks: CHUNK_BLOCKS,
+                            num_chunks,
+                            block_count,
+                            block_size,
+                            channels,
+                            samples_per_block,
+                            delay,
+                            total_valid,
+                        });
                     })
                     .expect("spawn HCA decode worker");
             }
             drop(tx);
-
-            // Writer: emit chunk byte payloads strictly in order.
-            let mut pending: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
-            for expect in 0..num_chunks {
-                let bytes = loop {
-                    if let Some(bytes) = pending.remove(&expect) {
-                        break bytes;
-                    }
-                    // Channel can only disconnect early if a worker panicked.
-                    let (c, payload) = rx
-                        .recv()
-                        .map_err(|_| HcaDecoderError::Hca(HcaError::InvalidParams))?;
-                    let bytes = payload?;
-                    if c == expect {
-                        break bytes;
-                    }
-                    pending.insert(c, bytes);
-                };
-                w.write_all(&bytes)?;
-            }
-            Ok(())
+            write_ordered_chunks(w, &rx, num_chunks)
         })?;
 
         self.current_block = self.info.block_count;
@@ -662,85 +620,195 @@ struct DecodeChunkArgs<'a> {
     scratch: &'a mut [u8],
 }
 
+struct DecodeWorkerArgs<'a> {
+    hca: &'a mut ClHca,
+    data: &'a [u8],
+    next_chunk: &'a AtomicUsize,
+    tx: SyncSender<(usize, Result<Vec<u8>, HcaError>)>,
+    chunk_blocks: usize,
+    num_chunks: usize,
+    block_count: usize,
+    block_size: usize,
+    channels: usize,
+    samples_per_block: usize,
+    delay: u64,
+    total_valid: u64,
+}
+
+fn run_decode_worker(args: DecodeWorkerArgs<'_>) {
+    let frame_f32 = args.channels * args.samples_per_block;
+    let mut block = vec![0u8; args.block_size];
+    let mut dct = vec![0f32; frame_f32];
+    let mut prev = vec![[0f32; 128]; args.channels];
+    let mut wave = [0f32; 128];
+    let mut pcm = vec![0i16; frame_f32];
+    let mut scratch = vec![0u8; frame_f32 * 2];
+
+    loop {
+        let chunk = args.next_chunk.fetch_add(1, Ordering::Relaxed);
+        if chunk >= args.num_chunks {
+            break;
+        }
+        let lo = chunk * args.chunk_blocks;
+        let hi = (lo + args.chunk_blocks).min(args.block_count);
+        let payload = decode_chunk_pcm(DecodeChunkArgs {
+            hca: args.hca,
+            data: args.data,
+            lo,
+            hi,
+            block_size: args.block_size,
+            channels: args.channels,
+            samples_per_block: args.samples_per_block,
+            delay: args.delay,
+            total_valid: args.total_valid,
+            block: &mut block,
+            dct: &mut dct,
+            prev: &mut prev,
+            wave: &mut wave,
+            pcm: &mut pcm,
+            scratch: &mut scratch,
+        });
+        if args.tx.send((chunk, payload)).is_err() {
+            break;
+        }
+    }
+}
+
+fn write_ordered_chunks<W: Write>(
+    writer: &mut W,
+    receiver: &Receiver<(usize, Result<Vec<u8>, HcaError>)>,
+    num_chunks: usize,
+) -> Result<(), HcaDecoderError> {
+    let mut pending = std::collections::BTreeMap::new();
+    for expected in 0..num_chunks {
+        let bytes = receive_expected_chunk(receiver, &mut pending, expected)?;
+        writer.write_all(&bytes)?;
+    }
+    Ok(())
+}
+
+fn receive_expected_chunk(
+    receiver: &Receiver<(usize, Result<Vec<u8>, HcaError>)>,
+    pending: &mut std::collections::BTreeMap<usize, Vec<u8>>,
+    expected: usize,
+) -> Result<Vec<u8>, HcaDecoderError> {
+    if let Some(bytes) = pending.remove(&expected) {
+        return Ok(bytes);
+    }
+    loop {
+        let (chunk, payload) = receiver
+            .recv()
+            .map_err(|_| HcaDecoderError::Hca(HcaError::InvalidParams))?;
+        let bytes = payload?;
+        if chunk == expected {
+            return Ok(bytes);
+        }
+        pending.insert(chunk, bytes);
+    }
+}
+
 /// Decode blocks `lo..hi` to final interleaved 16-bit PCM (LE bytes), with
 /// encoder delay/padding trimmed. Fully independent of other chunks: the IMDCT
 /// overlap state is a pure function of the preceding subframe's DCT output, so
 /// it is seeded by decoding block `lo - 1` (zeros at file start).
-fn decode_chunk_pcm(a: DecodeChunkArgs<'_>) -> Result<Vec<u8>, HcaError> {
+fn decode_chunk_pcm(mut a: DecodeChunkArgs<'_>) -> Result<Vec<u8>, HcaError> {
     let spb = a.samples_per_block;
     let frame_f32 = a.channels * spb;
     let mut bytes = Vec::with_capacity((a.hi - a.lo) * frame_f32 * 2);
 
-    // Seed the overlap state.
-    if a.lo == 0 {
-        for p in a.prev.iter_mut() {
-            p.fill(0.0);
-        }
-    } else {
-        let b = a.lo - 1;
-        a.block
-            .copy_from_slice(&a.data[b * a.block_size..(b + 1) * a.block_size]);
-        a.hca.decode_block_dct(a.block, a.dct)?;
-        for (ch, prev_ch) in a.prev.iter_mut().enumerate() {
-            let last = &a.dct[ch * spb + (HCA_SUBFRAMES - 1) * 128..][..128];
-            // imdct_overlap's `previous` output depends only on `dct`.
-            imdct_overlap(last.try_into().unwrap(), prev_ch, a.wave);
-        }
-    }
+    seed_chunk_overlap(&mut a)?;
 
     let mut wave2 = [0f32; 128];
-    for b in a.lo..a.hi {
+    for block in a.lo..a.hi {
         a.block
-            .copy_from_slice(&a.data[b * a.block_size..(b + 1) * a.block_size]);
+            .copy_from_slice(&a.data[block * a.block_size..(block + 1) * a.block_size]);
         a.hca.decode_block_dct(a.block, a.dct)?;
-        for sf in 0..HCA_SUBFRAMES {
-            if a.channels == 2 {
-                // Stereo: overlap both channels, then a pairwise interleave
-                // that the compiler can vectorize (no strided stores).
-                let dct0: &[f32; 128] = a.dct[sf * 128..][..128].try_into().unwrap();
-                let dct1: &[f32; 128] = a.dct[spb + sf * 128..][..128].try_into().unwrap();
-                imdct_overlap(dct0, &mut a.prev[0], a.wave);
-                imdct_overlap(dct1, &mut a.prev[1], &mut wave2);
-                let out = &mut a.pcm[sf * 256..(sf + 1) * 256];
-                for (pair, (&l, &r)) in out
-                    .as_chunks_mut::<2>()
-                    .0
-                    .iter_mut()
-                    .zip(a.wave.iter().zip(wave2.iter()))
-                {
-                    pair[0] = pcm_f32_to_i16(l);
-                    pair[1] = pcm_f32_to_i16(r);
-                }
-            } else {
-                for (ch, prev_ch) in a.prev.iter_mut().enumerate() {
-                    let dct: &[f32; 128] = a.dct[ch * spb + sf * 128..][..128].try_into().unwrap();
-                    imdct_overlap(dct, prev_ch, a.wave);
-                    let base = sf * 128 * a.channels + ch;
-                    for (j, &v) in a.wave.iter().enumerate() {
-                        a.pcm[base + j * a.channels] = pcm_f32_to_i16(v);
-                    }
-                }
-            }
-        }
-
-        // Static delay/padding trim: this block covers pre-trim sample frames
-        // [b*spb, (b+1)*spb); the valid output range is [delay, delay+total_valid).
-        let block_start = b as u64 * spb as u64;
-        let keep_lo = a.delay.saturating_sub(block_start).min(spb as u64) as usize;
-        let keep_hi = (a.delay + a.total_valid)
-            .saturating_sub(block_start)
-            .min(spb as u64) as usize;
-        if keep_hi > keep_lo {
-            // Writing into a Vec<u8> cannot fail.
-            write_pcm_i16_le(
-                &mut bytes,
-                &a.pcm[keep_lo * a.channels..keep_hi * a.channels],
-                a.scratch,
-            )
-            .expect("Vec write");
-        }
+        decode_chunk_block(&mut a, &mut wave2);
+        append_trimmed_pcm(&mut a, block, &mut bytes);
     }
     Ok(bytes)
+}
+
+fn seed_chunk_overlap(a: &mut DecodeChunkArgs<'_>) -> Result<(), HcaError> {
+    if a.lo == 0 {
+        for previous in a.prev.iter_mut() {
+            previous.fill(0.0);
+        }
+        return Ok(());
+    }
+
+    let block = a.lo - 1;
+    a.block
+        .copy_from_slice(&a.data[block * a.block_size..(block + 1) * a.block_size]);
+    a.hca.decode_block_dct(a.block, a.dct)?;
+    for (channel, previous) in a.prev.iter_mut().enumerate() {
+        let start = channel * a.samples_per_block + (HCA_SUBFRAMES - 1) * 128;
+        let last = &a.dct[start..start + 128];
+        imdct_overlap(last.try_into().unwrap(), previous, a.wave);
+    }
+    Ok(())
+}
+
+fn decode_chunk_block(a: &mut DecodeChunkArgs<'_>, wave2: &mut [f32; 128]) {
+    for subframe in 0..HCA_SUBFRAMES {
+        if a.channels == 2 {
+            decode_stereo_subframe(a, subframe, wave2);
+        } else {
+            decode_interleaved_subframe(a, subframe);
+        }
+    }
+}
+
+fn decode_stereo_subframe(
+    a: &mut DecodeChunkArgs<'_>,
+    subframe: usize,
+    right_wave: &mut [f32; 128],
+) {
+    let left_dct: &[f32; 128] = a.dct[subframe * 128..][..128].try_into().unwrap();
+    let right_start = a.samples_per_block + subframe * 128;
+    let right_dct: &[f32; 128] = a.dct[right_start..][..128].try_into().unwrap();
+    imdct_overlap(left_dct, &mut a.prev[0], a.wave);
+    imdct_overlap(right_dct, &mut a.prev[1], right_wave);
+    let output = &mut a.pcm[subframe * 256..(subframe + 1) * 256];
+    for (pair, (&left, &right)) in output
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(a.wave.iter().zip(right_wave.iter()))
+    {
+        pair[0] = pcm_f32_to_i16(left);
+        pair[1] = pcm_f32_to_i16(right);
+    }
+}
+
+fn decode_interleaved_subframe(a: &mut DecodeChunkArgs<'_>, subframe: usize) {
+    for (channel, previous) in a.prev.iter_mut().enumerate() {
+        let start = channel * a.samples_per_block + subframe * 128;
+        let dct: &[f32; 128] = a.dct[start..start + 128].try_into().unwrap();
+        imdct_overlap(dct, previous, a.wave);
+        let base = subframe * 128 * a.channels + channel;
+        for (sample, &value) in a.wave.iter().enumerate() {
+            a.pcm[base + sample * a.channels] = pcm_f32_to_i16(value);
+        }
+    }
+}
+
+fn append_trimmed_pcm(a: &mut DecodeChunkArgs<'_>, block: usize, bytes: &mut Vec<u8>) {
+    let samples_per_block = a.samples_per_block as u64;
+    let block_start = block as u64 * samples_per_block;
+    let keep_start = a.delay.saturating_sub(block_start).min(samples_per_block) as usize;
+    let keep_end = (a.delay + a.total_valid)
+        .saturating_sub(block_start)
+        .min(samples_per_block) as usize;
+    if keep_end <= keep_start {
+        return;
+    }
+    write_pcm_i16_le(
+        bytes,
+        &a.pcm[keep_start * a.channels..keep_end * a.channels],
+        a.scratch,
+    )
+    .expect("Vec write");
 }
 
 #[cfg(target_endian = "little")]

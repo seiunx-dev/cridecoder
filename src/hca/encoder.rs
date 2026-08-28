@@ -7,8 +7,8 @@
 use super::bitreader::BitWriter;
 use super::cipher::cipher_init;
 use super::decoder::{
-    crc16_checksum, ChannelType, HCA_MAX_CHANNELS, HCA_SAMPLES_PER_FRAME, HCA_SAMPLES_PER_SUBFRAME,
-    HCA_SUBFRAMES, HCA_VERSION_200,
+    assign_stereo_channel_types, crc16_checksum, ChannelType, HCA_MAX_CHANNELS,
+    HCA_SAMPLES_PER_FRAME, HCA_SAMPLES_PER_SUBFRAME, HCA_SUBFRAMES, HCA_VERSION_200,
 };
 use super::tables::{DEQUANTIZER_SCALING_TABLE, IMDCT_WINDOW, MAX_BIT_TABLE};
 use std::f32::consts::{PI, SQRT_2};
@@ -205,6 +205,92 @@ impl Default for ChannelEncodeState {
     }
 }
 
+fn quantize_intensity(left: f32, right: f32, total: f32) -> (u8, f32) {
+    let combined = left + right;
+    if combined <= 0.0 {
+        return (0, 1.0);
+    }
+
+    let stored_value = 2.0 * left / combined;
+    let energy_ratio = if total > 0.0 {
+        (combined / total).clamp(0.5, SQRT_2 / 2.0)
+    } else {
+        1.0
+    };
+    let mut value = 1;
+    while value < 13 && INTENSITY_RATIO_BOUNDS[value] >= stored_value {
+        value += 1;
+    }
+    (value as u8, energy_ratio)
+}
+
+fn hfr_spectra_average(
+    channel: &ChannelEncodeState,
+    mut band: usize,
+    group_size: usize,
+) -> (f32, usize) {
+    let mut sum = 0.0;
+    let mut count = 0;
+    for _ in 0..group_size {
+        if band >= HCA_SAMPLES_PER_SUBFRAME {
+            break;
+        }
+        for subframe in 0..HCA_SUBFRAMES {
+            sum += channel.spectra[subframe][band].abs();
+        }
+        count += HCA_SUBFRAMES;
+        band += 1;
+    }
+    let average = if count == 0 { 0.0 } else { sum / count as f32 };
+    (average, band)
+}
+
+fn hfr_source_average(
+    channel: &ChannelEncodeState,
+    hfr_start_band: usize,
+    hfr_band_count: usize,
+    mut band: usize,
+    group_size: usize,
+) -> (f32, usize) {
+    let mut sum = 0.0;
+    let mut count = 0;
+    for _ in 0..group_size {
+        if band >= hfr_band_count || band >= hfr_start_band {
+            break;
+        }
+        let source_band = hfr_start_band - band - 1;
+        for subframe in 0..HCA_SUBFRAMES {
+            sum += channel.scaled_spectra[source_band][subframe].abs();
+        }
+        count += HCA_SUBFRAMES;
+        band += 1;
+    }
+    let average = if count == 0 { 0.0 } else { sum / count as f32 };
+    (average, band)
+}
+
+fn spectral_bit_count(channel: &ChannelEncodeState, band: usize, resolution: usize) -> usize {
+    if resolution >= 8 {
+        let base_bits = MAX_BIT_TABLE[resolution] as usize - 1;
+        let dead_zone = QUANTIZER_DEAD_ZONE[resolution];
+        return channel.scaled_spectra[band]
+            .iter()
+            .map(|value| base_bits + usize::from(value.abs() >= dead_zone))
+            .sum();
+    }
+
+    let step_size = QUANTIZER_INVERSE_STEP_SIZE[resolution];
+    let shift_up = step_size + 1.0;
+    let shift_down = (step_size + 0.5 - 8.0) as i32;
+    channel.scaled_spectra[band]
+        .iter()
+        .map(|value| {
+            let quantized = (*value * step_size + shift_up) as i32 - shift_down;
+            QUANTIZE_SPECTRUM_BITS[resolution][quantized.clamp(0, 15) as usize] as usize
+        })
+        .sum()
+}
+
 /// HCA encoder.
 pub struct HcaEncoder {
     config: HcaEncoderConfig,
@@ -339,53 +425,12 @@ impl HcaEncoder {
         if self.stereo_band_count > 0 && channels_per_track > 1 {
             for track in 0..self.track_count as usize {
                 let base = track * channels_per_track as usize;
-                match channels_per_track {
-                    2 => {
-                        types[base] = ChannelType::StereoPrimary;
-                        types[base + 1] = ChannelType::StereoSecondary;
-                    }
-                    3 => {
-                        types[base] = ChannelType::StereoPrimary;
-                        types[base + 1] = ChannelType::StereoSecondary;
-                    }
-                    4 => {
-                        types[base] = ChannelType::StereoPrimary;
-                        types[base + 1] = ChannelType::StereoSecondary;
-                        if self.channel_config == 0 {
-                            types[base + 2] = ChannelType::StereoPrimary;
-                            types[base + 3] = ChannelType::StereoSecondary;
-                        }
-                    }
-                    5 => {
-                        types[base] = ChannelType::StereoPrimary;
-                        types[base + 1] = ChannelType::StereoSecondary;
-                        if self.channel_config <= 2 {
-                            types[base + 3] = ChannelType::StereoPrimary;
-                            types[base + 4] = ChannelType::StereoSecondary;
-                        }
-                    }
-                    6 => {
-                        types[base] = ChannelType::StereoPrimary;
-                        types[base + 1] = ChannelType::StereoSecondary;
-                        types[base + 4] = ChannelType::StereoPrimary;
-                        types[base + 5] = ChannelType::StereoSecondary;
-                    }
-                    7 => {
-                        types[base] = ChannelType::StereoPrimary;
-                        types[base + 1] = ChannelType::StereoSecondary;
-                        types[base + 4] = ChannelType::StereoPrimary;
-                        types[base + 5] = ChannelType::StereoSecondary;
-                    }
-                    8 => {
-                        types[base] = ChannelType::StereoPrimary;
-                        types[base + 1] = ChannelType::StereoSecondary;
-                        types[base + 4] = ChannelType::StereoPrimary;
-                        types[base + 5] = ChannelType::StereoSecondary;
-                        types[base + 6] = ChannelType::StereoPrimary;
-                        types[base + 7] = ChannelType::StereoSecondary;
-                    }
-                    _ => {}
-                }
+                let end = base + channels_per_track as usize;
+                assign_stereo_channel_types(
+                    &mut types[base..end],
+                    channels_per_track as usize,
+                    self.channel_config,
+                );
             }
         }
 
@@ -585,46 +630,36 @@ impl HcaEncoder {
             }
 
             for sf in 0..HCA_SUBFRAMES {
-                let mut energy_l = 0.0f32;
-                let mut energy_r = 0.0f32;
-                let mut energy_total = 0.0f32;
-
-                for b in self.base_band_count as usize..self.total_band_count as usize {
-                    let l = self.channel[c].spectra[sf][b];
-                    let r = self.channel[c + 1].spectra[sf][b];
-                    energy_l += l.abs();
-                    energy_r += r.abs();
-                    energy_total += (l + r).abs();
-                }
-                energy_total *= 2.0;
-
-                let energy_lr = energy_l + energy_r;
-                let mut energy_ratio = 1.0;
-                let quantized = if energy_lr > 0.0 {
-                    let stored_value = 2.0 * energy_l / energy_lr;
-                    if energy_total > 0.0 {
-                        energy_ratio = (energy_lr / energy_total).clamp(0.5, SQRT_2 / 2.0);
-                    }
-
-                    let mut value = 1usize;
-                    while value < 13 && INTENSITY_RATIO_BOUNDS[value] >= stored_value {
-                        value += 1;
-                    }
-                    value as u8
-                } else {
-                    0
-                };
-
+                let (energy_l, energy_r, energy_total) = self.stereo_energy(c, sf);
+                let (quantized, energy_ratio) =
+                    quantize_intensity(energy_l, energy_r, energy_total);
                 self.channel[c + 1].intensity[sf] = quantized;
-
-                for b in self.base_band_count as usize..self.total_band_count as usize {
-                    let mixed = (self.channel[c].spectra[sf][b]
-                        + self.channel[c + 1].spectra[sf][b])
-                        * energy_ratio;
-                    self.channel[c].spectra[sf][b] = mixed;
-                    self.channel[c + 1].spectra[sf][b] = 0.0;
-                }
+                self.mix_stereo_bands(c, sf, energy_ratio);
             }
+        }
+    }
+
+    fn stereo_energy(&self, channel: usize, subframe: usize) -> (f32, f32, f32) {
+        let mut left = 0.0;
+        let mut right = 0.0;
+        let mut total = 0.0;
+        for band in self.base_band_count as usize..self.total_band_count as usize {
+            let left_value = self.channel[channel].spectra[subframe][band];
+            let right_value = self.channel[channel + 1].spectra[subframe][band];
+            left += left_value.abs();
+            right += right_value.abs();
+            total += (left_value + right_value).abs();
+        }
+        (left, right, total * 2.0)
+    }
+
+    fn mix_stereo_bands(&mut self, channel: usize, subframe: usize, energy_ratio: f32) {
+        for band in self.base_band_count as usize..self.total_band_count as usize {
+            let mixed = (self.channel[channel].spectra[subframe][band]
+                + self.channel[channel + 1].spectra[subframe][band])
+                * energy_ratio;
+            self.channel[channel].spectra[subframe][band] = mixed;
+            self.channel[channel + 1].spectra[subframe][band] = 0.0;
         }
     }
 
@@ -670,24 +705,19 @@ impl HcaEncoder {
             if self.channel[c].channel_type == ChannelType::StereoSecondary {
                 continue;
             }
+            self.calculate_channel_hfr_averages(c, hfr_start_band);
+        }
+    }
 
-            let mut band = hfr_start_band;
-            for group in 0..self.hfr_group_count as usize {
-                let mut sum = 0.0f32;
-                let mut count = 0usize;
-                for _ in 0..self.bands_per_hfr_group as usize {
-                    if band >= HCA_SAMPLES_PER_SUBFRAME {
-                        break;
-                    }
-                    for sf in 0..HCA_SUBFRAMES {
-                        sum += self.channel[c].spectra[sf][band].abs();
-                    }
-                    count += HCA_SUBFRAMES;
-                    band += 1;
-                }
-                self.channel[c].hfr_group_average_spectra[group] =
-                    if count > 0 { sum / count as f32 } else { 0.0 };
-            }
+    fn calculate_channel_hfr_averages(&mut self, channel: usize, mut band: usize) {
+        for group in 0..self.hfr_group_count as usize {
+            let (average, next_band) = hfr_spectra_average(
+                &self.channel[channel],
+                band,
+                self.bands_per_hfr_group as usize,
+            );
+            self.channel[channel].hfr_group_average_spectra[group] = average;
+            band = next_band;
         }
     }
 
@@ -705,31 +735,31 @@ impl HcaEncoder {
             if self.channel[c].channel_type == ChannelType::StereoSecondary {
                 continue;
             }
+            self.calculate_channel_hfr_scale(c, hfr_start_band, hfr_band_count);
+        }
+    }
 
-            let mut band = 0usize;
-            for group in 0..self.hfr_group_count as usize {
-                let mut sum = 0.0f32;
-                let mut count = 0usize;
-
-                for _ in 0..self.bands_per_hfr_group as usize {
-                    if band >= hfr_band_count || hfr_start_band <= band {
-                        break;
-                    }
-                    let source_band = hfr_start_band - band - 1;
-                    for sf in 0..HCA_SUBFRAMES {
-                        sum += self.channel[c].scaled_spectra[source_band][sf].abs();
-                    }
-                    count += HCA_SUBFRAMES;
-                    band += 1;
-                }
-
-                let average = if count > 0 { sum / count as f32 } else { 0.0 };
-                let mut group_spectra = self.channel[c].hfr_group_average_spectra[group];
-                if average > 0.0 {
-                    group_spectra *= (1.0 / average).min(SQRT_2);
-                }
-                self.channel[c].hfr_scales[group] = find_scale_factor(group_spectra);
+    fn calculate_channel_hfr_scale(
+        &mut self,
+        channel: usize,
+        hfr_start_band: usize,
+        hfr_band_count: usize,
+    ) {
+        let mut band = 0;
+        for group in 0..self.hfr_group_count as usize {
+            let (average, next_band) = hfr_source_average(
+                &self.channel[channel],
+                hfr_start_band,
+                hfr_band_count,
+                band,
+                self.bands_per_hfr_group as usize,
+            );
+            let mut group_spectra = self.channel[channel].hfr_group_average_spectra[group];
+            if average > 0.0 {
+                group_spectra *= (1.0 / average).min(SQRT_2);
             }
+            self.channel[channel].hfr_scales[group] = find_scale_factor(group_spectra);
+            band = next_band;
         }
     }
 
@@ -895,28 +925,7 @@ impl HcaEncoder {
                     noise_level
                 };
                 let resolution = calculate_resolution(channel.scale_factors[band], noise) as usize;
-
-                if resolution >= 8 {
-                    let bits = MAX_BIT_TABLE[resolution] as usize - 1;
-                    let dead_zone = QUANTIZER_DEAD_ZONE[resolution];
-                    for sf in 0..HCA_SUBFRAMES {
-                        length += bits;
-                        if channel.scaled_spectra[band][sf].abs() >= dead_zone {
-                            length += 1;
-                        }
-                    }
-                } else {
-                    let step_size = QUANTIZER_INVERSE_STEP_SIZE[resolution];
-                    let shift_up = step_size + 1.0;
-                    let shift_down = (step_size + 0.5 - 8.0) as i32;
-                    for sf in 0..HCA_SUBFRAMES {
-                        let quantized = (channel.scaled_spectra[band][sf] * step_size + shift_up)
-                            as i32
-                            - shift_down;
-                        let index = quantized.clamp(0, 15) as usize;
-                        length += QUANTIZE_SPECTRUM_BITS[resolution][index] as usize;
-                    }
-                }
+                length += spectral_bit_count(channel, band, resolution);
             }
         }
 

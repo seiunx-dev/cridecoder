@@ -670,7 +670,7 @@ pub fn read_metadata_file(usm_path: &Path) -> Result<Metadata, MetadataError> {
     let file = File::open(usm_path)?;
     let fallback_name = usm_path
         .file_name()
-        .and_then(|s| s.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .map(|s| s.as_bytes().to_vec())
         .unwrap_or_default();
 

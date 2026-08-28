@@ -184,7 +184,7 @@ fn load_external_awbs(
         Err(_) => return external_awbs,
     };
 
-    let acb_dir = acb_file_path.and_then(|p| p.parent());
+    let acb_dir = acb_file_path.and_then(Path::parent);
 
     for awb_row in &hash_table.rows {
         let awb_name = match get_string_field(awb_row, "Name") {
