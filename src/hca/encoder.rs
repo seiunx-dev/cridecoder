@@ -1271,6 +1271,32 @@ pub fn encode_wav_to_hca<W: Write + Seek>(
 mod tests {
     use super::*;
 
+    fn make_test_wav(bits_per_sample: u16) -> Vec<u8> {
+        let bytes_per_sample = usize::from(bits_per_sample / 8);
+        let sample_data = vec![0x20; bytes_per_sample.max(1) * 4];
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"JUNK");
+        wav.extend_from_slice(&1u32.to_le_bytes());
+        wav.extend_from_slice(&[0, 0]);
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&44100u32.to_le_bytes());
+        wav.extend_from_slice(&(44100 * u32::from(bits_per_sample) / 8).to_le_bytes());
+        wav.extend_from_slice(&(bits_per_sample / 8).to_le_bytes());
+        wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(sample_data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&sample_data);
+        let riff_size = (wav.len() - 8) as u32;
+        wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        wav
+    }
+
     #[test]
     fn test_encoder_config() {
         let config = HcaEncoderConfig::new(44100, 2).with_bitrate(256000);
@@ -1426,5 +1452,29 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_diff == 0.0, "keycode+subkey must recover identical PCM");
+    }
+
+    #[test]
+    fn test_encode_wav_formats_and_invalid_inputs() {
+        assert!(matches!(
+            encode_wav_to_hca(&[], &mut std::io::Cursor::new(Vec::new()), None),
+            Err(HcaEncoderError::NoSamples)
+        ));
+
+        let mut no_data = make_test_wav(16);
+        no_data.truncate(no_data.len() - 12);
+        assert!(matches!(
+            encode_wav_to_hca(&no_data, &mut std::io::Cursor::new(Vec::new()), None),
+            Err(HcaEncoderError::NoSamples)
+        ));
+
+        for bits in [8, 16, 24, 32] {
+            let wav = make_test_wav(bits);
+            let mut output = std::io::Cursor::new(Vec::new());
+            let config = (bits == 32).then(|| HcaEncoderConfig::new(44100, 1));
+            encode_wav_to_hca(&wav, &mut output, config).unwrap();
+            let hca = output.into_inner();
+            assert!(hca.starts_with(b"HCA\0"), "failed for {bits}-bit WAV");
+        }
     }
 }

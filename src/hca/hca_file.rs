@@ -896,6 +896,25 @@ impl From<HcaError> for HcaDecoderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hca::encoder::{HcaEncoder, HcaEncoderConfig};
+    use std::io::Cursor;
+
+    fn encoded_hca(key: Option<u64>) -> Vec<u8> {
+        let samples: Vec<f32> = (0..HCA_SUBFRAMES * 128 * 9)
+            .map(|i| {
+                let phase = 2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0;
+                phase.sin() * 0.35
+            })
+            .collect();
+        let mut config = HcaEncoderConfig::new(44100, 1).with_bitrate(128000);
+        if let Some(key) = key {
+            config = config.with_encryption(key);
+        }
+        let mut encoder = HcaEncoder::new(config).unwrap();
+        let mut output = Cursor::new(Vec::new());
+        encoder.encode(&samples, &mut output).unwrap();
+        output.into_inner()
+    }
 
     #[test]
     fn test_scale_frame_score() {
@@ -937,5 +956,80 @@ mod tests {
 
         let err = HcaDecoderError::InvalidSampleRange;
         assert_eq!(format!("{}", err), "Invalid sample range");
+    }
+
+    #[test]
+    fn test_generated_hca_streaming_file_and_parallel_apis() {
+        let data = encoded_hca(None);
+        let mut decoder = HcaDecoder::from_reader(Cursor::new(data.clone())).unwrap();
+        assert_eq!(decoder.info().channel_count, 1);
+        assert!(decoder.info().block_count >= 7);
+
+        let mut too_small = vec![0i16; decoder.info().samples_per_block - 1];
+        assert!(matches!(
+            decoder.decode_frame_i16(&mut too_small),
+            Err(HcaDecoderError::InvalidSampleRange)
+        ));
+
+        let (_, frames) = decoder.decode_frame().unwrap();
+        assert!(frames <= decoder.info().samples_per_block);
+        decoder.reset();
+        let mut pcm = vec![0i16; decoder.info().samples_per_block];
+        let frames = decoder.decode_frame_i16(&mut pcm).unwrap();
+        assert!(frames <= decoder.info().samples_per_block);
+        decoder.seek(100);
+        assert!(decoder.decode_frame().is_ok());
+
+        let all = decoder.decode_all().unwrap();
+        assert!(!all.is_empty());
+        let mut chunk_samples = 0usize;
+        decoder
+            .decode_to_pcm16_chunks(|chunk| {
+                chunk_samples += chunk.len();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(chunk_samples, all.len());
+
+        let mut serial = Vec::new();
+        decoder.decode_to_wav(&mut serial).unwrap();
+        let mut parallel = Vec::new();
+        decoder.decode_to_wav_parallel(&mut parallel, 2).unwrap();
+        assert_eq!(parallel, serial);
+        assert_eq!(&serial[..4], b"RIFF");
+
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), &data).unwrap();
+        let mut file_decoder = HcaDecoder::from_file(temp.path().to_str().unwrap()).unwrap();
+        assert_eq!(file_decoder.decode_all().unwrap().len(), all.len());
+
+        assert!(matches!(
+            HcaDecoder::from_reader(Cursor::new(b"not hca!".to_vec())),
+            Err(HcaDecoderError::InvalidHeader)
+        ));
+        assert!(matches!(
+            HcaDecoder::from_reader(Cursor::new(vec![0; 2])),
+            Err(HcaDecoderError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn test_generated_hca_key_scoring() {
+        let key = 0x1234_5678_90ab_cdef;
+        let data = encoded_hca(Some(key));
+        let mut decoder = HcaDecoder::from_reader(Cursor::new(data)).unwrap();
+        let mut key_test = KeyTest {
+            key,
+            ..Default::default()
+        };
+        decoder.test_key(&mut key_test);
+        assert!(key_test.start_offset >= decoder.info().header_size);
+        assert_eq!(key_test.best_key, key);
+        assert!(key_test.best_score > 0);
+
+        // A second, worse candidate must not replace the established best key.
+        key_test.key = key ^ 0xffff;
+        decoder.test_key(&mut key_test);
+        assert_eq!(key_test.best_key, key);
     }
 }

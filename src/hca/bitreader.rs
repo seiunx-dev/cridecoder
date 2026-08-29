@@ -428,4 +428,66 @@ mod tests {
         assert_eq!(reader.position(), 8);
         assert_eq!(reader.peek(8), 0xCD);
     }
+
+    #[test]
+    fn test_reader_helpers_and_accumulator() {
+        let data = [0b0100_1101, 0b0011_0101, 0xaa, 0x55, 0xf0];
+        let mut reader = BitReader::new(&data);
+        assert_eq!(reader.data(), &data);
+        assert_eq!(reader.peek(0), 0);
+        assert_eq!(reader.peek(33), 0);
+        assert!(reader.has_bits(40));
+        assert_eq!(reader.remaining_bits(), 40);
+
+        assert_eq!(reader.read_hca_bits(0), 0);
+        assert_eq!(reader.read_hca_bits(3), 0b010);
+        reader.advance_signed(2);
+        assert_eq!(reader.position(), 5);
+        reader.advance_signed(-3);
+        assert_eq!(reader.position(), 2);
+        reader.advance_signed(-10);
+        assert_eq!(reader.position(), 0);
+        assert!(!reader.read_bit());
+        assert_eq!(reader.remaining_bits(), 39);
+
+        reader.set_position(3);
+        let mut acc = reader.acc();
+        assert_eq!(acc.read(5), 0b01101);
+        assert_eq!(acc.read(8), 0b00110101);
+        acc.sync(&mut reader);
+        assert_eq!(reader.position(), 16);
+
+        reader.set_position(35);
+        assert_eq!(reader.read_hca_bits(4), 0b1000);
+        assert_eq!(reader.remaining_bits(), 1);
+        assert!(!reader.has_bits(2));
+    }
+
+    #[test]
+    fn test_variable_values_and_writer_boundaries() {
+        let mut encoded = BitWriter::new(3);
+        encoded.write(0b0_1001_1010, 9);
+        encoded.write(0, 0);
+        encoded.write(u32::MAX, 33);
+        assert_eq!(encoded.position(), 9);
+
+        let mut reader = BitReader::new(encoded.data());
+        assert_eq!(reader.read_scale_count(), (2, 10));
+
+        let mut zero_scale = BitReader::new(&[0]);
+        assert_eq!(zero_scale.read_scale_count(), (0, 0));
+        assert_eq!(zero_scale.read_signed(0), 0);
+
+        let mut positive = BitReader::new(&[0b0110_0000]);
+        assert_eq!(positive.read_signed(4), 6);
+        let mut off_by_one = BitReader::new(&[0b0100_0000]);
+        assert_eq!(off_by_one.read_off_by_one(1), 0);
+        assert_eq!(off_by_one.read_off_by_one(2), 3);
+
+        let mut bounded = BitWriter::new(1);
+        bounded.write(0xaa, 8);
+        bounded.write(0xff, 8);
+        assert_eq!(bounded.position(), 16);
+        assert_eq!(bounded.into_vec(), vec![0xaa]);
+    }
 }

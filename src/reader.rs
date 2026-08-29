@@ -186,4 +186,61 @@ mod tests {
         assert_eq!(align(4, 5), 8);
         assert_eq!(align(32, 100), 128);
     }
+
+    #[test]
+    fn test_reader_typed_and_positioned_helpers() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x1234u16.to_be_bytes());
+        data.extend_from_slice(&(-2i16).to_be_bytes());
+        data.extend_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
+        data.extend_from_slice(&1.5f32.to_be_bytes());
+        data.extend_from_slice(&0x5678u16.to_le_bytes());
+        data.extend_from_slice(&0x90ab_cdefu32.to_le_bytes());
+        data.extend_from_slice(b"name\0");
+
+        let mut reader = Reader::new(Cursor::new(data));
+        assert_eq!(reader.read_u16().unwrap(), 0x1234);
+        assert_eq!(reader.read_i16().unwrap(), -2);
+        assert_eq!(reader.read_u64().unwrap(), 0x1122_3344_5566_7788);
+        assert_eq!(reader.read_f32().unwrap(), 1.5);
+        assert_eq!(reader.read_u16_le().unwrap(), 0x5678);
+        assert_eq!(reader.read_u32_le().unwrap(), 0x90ab_cdef);
+        let string_offset = reader.stream_position().unwrap();
+        assert_eq!(reader.read_string0_at(string_offset).unwrap(), "name");
+        assert_eq!(reader.stream_position().unwrap(), string_offset);
+        assert_eq!(reader.read_string0().unwrap(), "name");
+        assert_eq!(reader.into_inner().position(), string_offset + 5);
+    }
+
+    #[test]
+    fn test_reader_copy_and_exact_read_failures() {
+        let mut reader = Reader::new(Cursor::new(b"abcdef".to_vec()));
+        reader.seek(SeekFrom::Start(2)).unwrap();
+        assert_eq!(reader.read_bytes_at(2, 0).unwrap(), b"ab");
+        assert_eq!(reader.stream_position().unwrap(), 2);
+
+        let mut appended = vec![b'x'];
+        reader.read_into_vec(3, &mut appended).unwrap();
+        assert_eq!(appended, b"xcde");
+        let before = appended.clone();
+        assert!(reader.read_into_vec(3, &mut appended).is_err());
+        assert_eq!(appended, before);
+
+        let mut copied = Vec::new();
+        let mut reader = Reader::new(Cursor::new(b"copy".to_vec()));
+        assert_eq!(reader.copy_to_writer(4, &mut copied).unwrap(), 4);
+        assert_eq!(copied, b"copy");
+        assert!(reader.copy_to_writer(1, &mut copied).is_err());
+    }
+
+    #[test]
+    fn test_decode_cri_string_encodings() {
+        assert_eq!(decode_cri_string(b"utf8"), "utf8");
+        assert_eq!(
+            decode_cri_string(&[0x83, 0x65, 0x83, 0x58, 0x83, 0x67]),
+            "テスト"
+        );
+        assert_eq!(decode_cri_string(&[0x41, 0, 0xff, 0xff]), "A\u{ffff}");
+        assert_eq!(align(0, 7), 7);
+    }
 }

@@ -592,4 +592,39 @@ mod tests {
         assert_eq!(vmask[1].len(), 0x20);
         assert_eq!(amask.len(), 0x20);
     }
+
+    #[test]
+    fn test_builder_audio_encryption_and_multiple_chunks() {
+        let mut missing_video = std::io::Cursor::new(Vec::new());
+        assert!(matches!(
+            UsmBuilder::new("missing.usm").build(&mut missing_video),
+            Err(UsmBuilderError::NoVideoStream)
+        ));
+
+        let video = vec![0x56; 0x1_0020];
+        let audio = vec![0x41; 0x1_0040];
+        let mut builder = UsmBuilder::new("encrypted.usm")
+            .video(video)
+            .encryption_key(0x1234_5678_9abc_def0);
+        builder.add_audio(audio);
+
+        let mut output = std::io::Cursor::new(Vec::new());
+        builder.build(&mut output).unwrap();
+        let data = output.into_inner();
+
+        assert_eq!(&data[..4], b"CRID");
+        assert!(data.windows(4).any(|window| window == b"@SFA"));
+        assert_eq!(
+            data.windows(4).filter(|window| *window == b"@SBV").count(),
+            2
+        );
+        assert_eq!(
+            data.windows(4).filter(|window| *window == b"@SBA").count(),
+            2
+        );
+        assert_eq!(
+            data.windows(4).filter(|window| *window == b"@END").count(),
+            2
+        );
+    }
 }
