@@ -487,7 +487,7 @@ fn parse_usm_header<R: Read + Seek>(
     let offset = 8 + block_size as i64;
 
     let (has_audio, mpeg_codec, audio_codec, offset) = parse_usm_header_chunks(reader, offset)?;
-    skip_metadata_section(reader, offset)?;
+    skip_metadata_section(reader, offset, has_audio)?;
 
     Ok((filename, has_audio, mpeg_codec, audio_codec))
 }
@@ -581,6 +581,7 @@ fn seek_and_check_signature<R: Read + Seek>(
 fn skip_metadata_section<R: Read + Seek>(
     reader: &mut Reader<R>,
     mut offset: i64,
+    has_audio: bool,
 ) -> Result<(), UsmError> {
     // First metadata @SFV
     seek_and_check_signature(reader, offset, "@SFV")?;
@@ -588,6 +589,29 @@ fn skip_metadata_section<R: Read + Seek>(
     reader.seek(SeekFrom::Start((offset + 0x20) as u64))?;
     let _ = get_utf_table(reader)?;
     offset += 8 + block_size as i64;
+
+    // Optional audio metadata: video metadata, audio metadata, then one `#METADATA END` per
+    // stream. Stream data starts right after the audio end marker's chunk.
+    if has_audio {
+        reader.seek(SeekFrom::Start(offset as u64))?;
+        if reader.read_bytes(4)? == b"@SFA" {
+            let block_size = reader.read_u32()?;
+            reader.seek(SeekFrom::Start((offset + 0x20) as u64))?;
+            let _ = get_utf_table(reader)?;
+            offset += 8 + block_size as i64;
+            for signature in [b"@SFV", b"@SFA"] {
+                seek_and_check_signature(reader, offset, std::str::from_utf8(signature).unwrap())?;
+                let block_size = reader.read_u32()?;
+                reader.seek(SeekFrom::Start((offset + 0x20) as u64))?;
+                if reader.read_bytes(13)? != b"#METADATA END" {
+                    return Err(UsmError::ExpectedMarker("#METADATA END".to_string()));
+                }
+                offset += 8 + block_size as i64;
+            }
+            reader.seek(SeekFrom::Start(offset as u64))?;
+            return Ok(());
+        }
+    }
 
     // Second metadata @SFV with METADATA END
     seek_and_check_signature(reader, offset, "@SFV")?;
