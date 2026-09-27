@@ -386,6 +386,31 @@ fn read_metadata_sections<R: Read + Seek>(
     sections.push(video_metadata);
     offset = next_offset;
 
+    // Optional audio metadata. Some encoders also write an audio seek table; the metadata area is
+    // then video metadata, audio metadata, and one `#METADATA END` per stream.
+    if has_audio && read_signature_at(reader, offset)? == "@SFA" {
+        let (audio_metadata, next_offset) =
+            read_utf_section(reader, offset, "@SFA", "audio_metadata")?;
+        sections.push(audio_metadata);
+        let (video_metadata_end, next_offset) = read_marker_section(
+            reader,
+            next_offset,
+            "@SFV",
+            "video_metadata_end",
+            "#METADATA END",
+        )?;
+        sections.push(video_metadata_end);
+        let (audio_metadata_end, stream_offset) = read_marker_section(
+            reader,
+            next_offset,
+            "@SFA",
+            "audio_metadata_end",
+            "#METADATA END",
+        )?;
+        sections.push(audio_metadata_end);
+        return Ok((has_audio, sections, stream_offset));
+    }
+
     // Video metadata end
     let (video_metadata_end, stream_offset) = read_metadata_end_section(reader, offset)?;
     sections.push(video_metadata_end);
@@ -784,7 +809,11 @@ mod tests {
     }
 
     fn make_metadata_end_chunk() -> Vec<u8> {
-        let mut chunk = make_chunk(b"@SFV", b"#METADATA END");
+        make_metadata_end_chunk_for(b"@SFV")
+    }
+
+    fn make_metadata_end_chunk_for(signature: &[u8; 4]) -> Vec<u8> {
+        let mut chunk = make_chunk(signature, b"#METADATA END");
         chunk.extend_from_slice(&[0; 16]);
         let block_size = (chunk.len() - 8) as u32;
         chunk[4..8].copy_from_slice(&block_size.to_be_bytes());
@@ -805,6 +834,10 @@ mod tests {
     }
 
     fn make_test_usm(has_audio: bool) -> Vec<u8> {
+        make_test_usm_with(has_audio, false)
+    }
+
+    fn make_test_usm_with(has_audio: bool, audio_metadata: bool) -> Vec<u8> {
         let crid = make_utf(
             "CRIUSF_DIR_STREAM",
             &[TestField::String("filename", "sample.usm")],
@@ -830,7 +863,16 @@ mod tests {
             usm.extend_from_slice(&make_chunk(b"@SFA", b"#HEADER END"));
         }
         usm.extend_from_slice(&make_chunk(b"@SFV", &video_metadata));
-        usm.extend_from_slice(&make_metadata_end_chunk());
+        if audio_metadata {
+            // Layout seen in a Global kr loading movie: an audio seek table follows the video
+            // one, then each stream ends its metadata separately.
+            let audio_metadata = make_utf("AUDIO_SEEKINFO", &[TestField::UInt("num_skip", 0)]);
+            usm.extend_from_slice(&make_chunk(b"@SFA", &audio_metadata));
+            usm.extend_from_slice(&make_metadata_end_chunk_for(b"@SFV"));
+            usm.extend_from_slice(&make_metadata_end_chunk_for(b"@SFA"));
+        } else {
+            usm.extend_from_slice(&make_metadata_end_chunk());
+        }
 
         // A contents marker exercises the extractor's skip path without ending
         // the other stream, matching how real USMs terminate each stream.
@@ -860,6 +902,64 @@ mod tests {
         let metadata = read_metadata(Cursor::new(make_test_usm(false)), b"fallback.usm").unwrap();
         assert!(!metadata.has_audio);
         assert_eq!(metadata.sections.len(), 5);
+    }
+
+    #[test]
+    fn reads_and_extracts_usm_with_audio_metadata() {
+        let usm = make_test_usm_with(true, true);
+        let metadata = read_metadata(Cursor::new(&usm), b"fallback.usm").unwrap();
+        let kinds: Vec<_> = metadata.sections.iter().map(|s| s.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "crid",
+                "video_header",
+                "audio_header",
+                "video_header_end",
+                "audio_header_end",
+                "video_metadata",
+                "audio_metadata",
+                "video_metadata_end",
+                "audio_metadata_end",
+            ]
+        );
+        // Streams start right after the audio end marker, at the first stream chunk.
+        let end = &metadata.sections[8];
+        let stream_offset = end.offset + 8 + i64::from(end.block_size.unwrap());
+        assert_eq!(metadata.stream_offset, stream_offset);
+        assert_eq!(
+            &usm[stream_offset as usize..stream_offset as usize + 4],
+            b"@SFV"
+        );
+
+        let memory: Vec<Vec<u8>> =
+            extract_usm_to_memory(Cursor::new(&usm), b"fallback.usm", None, true)
+                .unwrap()
+                .into_iter()
+                .map(|stream| stream.data)
+                .collect();
+        let temp = tempfile::tempdir().unwrap();
+        let files: Vec<Vec<u8>> =
+            extract_usm(Cursor::new(&usm), temp.path(), b"fallback.usm", None, true)
+                .unwrap()
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect();
+        for streams in [memory, files] {
+            assert_eq!(streams, [vec![0x56; 0x300], vec![0x41; 0x180]]);
+        }
+
+        // Without the audio end marker the layout is rejected instead of misreading streams.
+        let mut truncated = make_test_usm_with(true, true);
+        let at = truncated
+            .windows(13)
+            .rposition(|w| w == b"#METADATA END")
+            .unwrap();
+        truncated[at..at + 13].copy_from_slice(b"#METADATA EN_");
+        assert!(read_metadata(Cursor::new(&truncated), b"fallback.usm").is_err());
+        assert!(
+            extract_usm_to_memory(Cursor::new(&truncated), b"fallback.usm", None, true).is_err()
+        );
     }
 
     #[test]
