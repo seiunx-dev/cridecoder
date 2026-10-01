@@ -1,0 +1,98 @@
+name: Release
+# Replaces release-crate.yml + release-python.yml (release: published). Pushing the tag now
+# creates the GitHub Release instead of the other way round.
+# PyPI trusted publishing is bound to the workflow FILE: before the first tag, add a trusted
+# publisher for workflow release.yml (environment pypi) on cridecoder; the current one
+# names release-python.yml, so the first upload would fail with invalid-publisher.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: # dry run: builds everything, publishes nothing
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Gate
+    permissions:
+      contents: read
+      checks: read
+    uses: seiunx-dev/ci-templates/.github/workflows/release-gate.yml@v1
+
+  wheels:
+    name: Wheels
+    needs: gate
+    uses: seiunx-dev/ci-templates/.github/workflows/maturin-wheels.yml@v1
+    with:
+      version: ${{ needs.gate.outputs.version }}
+      # Not abi3 (pyo3 features: extension-module only): same wheel set as release-python.yml,
+      # i.e. every interpreter in the manylinux container (cp39-cp315t, PyPy 3.11) and
+      # 3.9-3.14t on macOS/Windows.
+      interpreters: find
+      setup-python-versions: "3.9 3.10 3.11 3.12 3.13 3.14 3.14t"
+      targets: >-
+        [{"label":"linux-x64","os":"ubuntu-latest","target":"x86_64"},
+         {"label":"linux-arm64","os":"ubuntu-latest","target":"aarch64","test":false},
+         {"label":"macos-arm64","os":"macos-15","target":"aarch64-apple-darwin"},
+         {"label":"macos-x64","os":"macos-15","target":"x86_64-apple-darwin","test":false},
+         {"label":"windows-x64","os":"windows-latest","target":"x64"}]
+      smoke-import: cridecoder
+
+  publish:
+    name: GitHub Release
+    needs: [gate, wheels]
+    if: needs.gate.outputs.is-tag == 'true'
+    permissions:
+      contents: write
+    uses: seiunx-dev/ci-templates/.github/workflows/gh-release.yml@v1
+    with:
+      tag: ${{ needs.gate.outputs.tag }}
+      prerelease: ${{ needs.gate.outputs.prerelease }}
+      artifact-pattern: ""
+
+  pypi:
+    name: PyPI
+    needs: [gate, wheels, publish]
+    if: needs.gate.outputs.is-tag == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Trusted publishing must run in this (caller) workflow, not in a reusable one.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/cridecoder
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          skip-existing: true
+
+  crates:
+    name: crates.io
+    needs: [gate, publish]
+    if: needs.gate.outputs.is-tag == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: seiunx-dev/ci-templates/actions/setup-rust@v1
+        with:
+          cache: "false"
+      - uses: seiunx-dev/ci-templates/actions/cargo-publish@v1
+        with:
+          packages: cridecoder
+          token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
