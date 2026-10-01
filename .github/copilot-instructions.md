@@ -89,17 +89,47 @@ Examples from this repo's history:
 
 ## GitHub Actions workflows
 
-Use the standardized workflow layout in `.github/workflows`:
+CI reuses the shared templates in
+[`seiunx-dev/ci-templates`](https://github.com/seiunx-dev/ci-templates) at `@v1`.
+The files in `.github/workflows` are thin callers:
 
-- `ci.yml` runs on `main` pushes, pull requests targeting `main`, and manual dispatch.
-- Rust CI order: `cargo fmt --all -- --check`, `cargo check --locked --all-targets`, `cargo clippy --locked --all-targets -- -D warnings`, then `cargo test --locked`.
-- `release-crate.yml` publishes the Rust crate and keeps its package-specific release flow.
-- `release-python.yml` builds and publishes Python artifacts and keeps its package-specific release flow.
+- `ci.yml` (`CI`) runs on `main` pushes, pull requests targeting `main`, and manual
+  dispatch:
+  - `Rust` (`rust-ci`): `cargo fmt --check`, clippy `--all-targets -D warnings` for the
+    default features and for `--features python`, and the tests run once under
+    `cargo llvm-cov` (`RUST_MIN_STACK=16777216`).
+  - `Wheel smoke` (`maturin-wheels`): builds one linux-x64 wheel and imports
+    `cridecoder` from it, so the PyO3 bindings are compiled on every PR.
+  - `Sonar` scans the coverage (skipped green on Dependabot/fork PRs); `Workflow lint`
+    runs actionlint.
+- The aggregate job **`CI OK`** is the only required status check.
+- `release.yml` (`Release`) replaces the old `release-crate.yml` / `release-python.yml`
+  (which rewrote the version from the tag with `sed`). Bump `version` in **both**
+  `Cargo.toml` and `pyproject.toml` (and the package's own entry in `Cargo.lock`) in a PR
+  → merge and wait for `CI OK` on `main` → push the tag `v<version>`. Pushing the tag
+  creates the GitHub Release; do not create the Release by hand first.
+  `release-gate` refuses a tag that differs from `Cargo.toml` and waits for `CI OK` on
+  the tagged commit; then the wheels are built (not abi3: one wheel per interpreter,
+  linux x64/arm64 in the manylinux container, macOS arm64/x64 and Windows x64 for
+  3.9–3.14t) plus the sdist, the GitHub Release is published, and the wheels go to PyPI
+  (trusted publishing, environment `pypi`) and the crate to crates.io (environment
+  `crates-io`, `CARGO_REGISTRY_TOKEN`). Manual dispatch is a dry run: it builds the
+  wheels and publishes nothing.
+- CI never rewrites `Cargo.toml` / `pyproject.toml` or regenerates `Cargo.lock`.
 
 Workflow maintenance rules:
 
-- Keep workflow filenames and top-level names aligned: `CI`, `Release`, `Docker`, and optional package-specific names.
-- Use `actions/checkout@v6`, `actions/setup-go@v6`, `actions/upload-artifact@v7`, `actions/download-artifact@v8`, `softprops/action-gh-release@v3`, and current Docker actions (`setup-buildx@v4`, `login@v4`, `metadata@v6`, `build-push@v7`).
-- Keep `permissions` minimal: `contents: read` for CI/Docker build-only work, `contents: write` for release publishing, and `packages: write` only when pushing container images.
-- Use workflow `concurrency` keyed by workflow name and ref, with release jobs using `release-${{ github.ref_name }}` and `cancel-in-progress: false`.
-- Do not reintroduce legacy workflow names such as `rust-ci.yml`, `build.yml`, `release-build.yml`, `docker-build.yml`, or `docker-release.yml` unless a package-specific workflow already exists and is intentionally preserved.
+- Use the shared templates first. Add custom jobs or steps only when a template
+  genuinely cannot meet the project's needs, keep them in the thin caller files, and
+  add a comment explaining why. The PyPI and crates.io publish jobs live in
+  `release.yml` because trusted publishing is bound to the calling workflow file.
+- Template bugs and missing features are fixed upstream in `seiunx-dev/ci-templates`
+  (new `v1.x.y` tag), not worked around here.
+- Keep top-level `permissions: contents: read`; grant `contents: write` / `id-token: write`
+  only on the job that needs it.
+- Do not set `sonar.projectVersion` or `*.reportPaths` in `sonar-project.properties`, and
+  do not suppress `githubactions:S7637` there: the template's `sonar.yml` passes the
+  version (`project-version: auto`) and report paths, and ignores S7637 for the `@v1`
+  references.
+- Third-party actions in caller-side custom steps are pinned to a full commit SHA with a
+  `# vX.Y.Z` comment; Dependabot (`github-actions`) updates them and the template refs.
