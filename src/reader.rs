@@ -67,6 +67,22 @@ impl<R: Read + Seek> Reader<R> {
         self.inner.read_u32::<LittleEndian>()
     }
 
+    /// Fill as much of `buf` as the source has left, retrying on
+    /// `Interrupted`. Returns the byte count, which is short only at EOF. On
+    /// an I/O error, returns the bytes read so far alongside the error.
+    pub fn read_up_to(&mut self, buf: &mut [u8]) -> (usize, io::Result<()>) {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match self.inner.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return (filled, Err(e)),
+            }
+        }
+        (filled, Ok(()))
+    }
+
     /// Read exact number of bytes
     pub fn read_bytes(&mut self, n: usize) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; n];

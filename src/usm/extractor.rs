@@ -656,6 +656,68 @@ fn create_output_files(
     Ok((video_file, audio_file, output_files))
 }
 
+/// Bytes of a stream chunk read up front: signature, block size, the 0x18-byte
+/// chunk header and the 13 bytes compared against `#CONTENTS END`.
+const CHUNK_PREFIX_LEN: usize = 0x20 + 13;
+
+/// One stream chunk's header, read with a single `read` call instead of a
+/// dozen small reads and seeks (each a syscall on an unbuffered `File`).
+struct ChunkHeader {
+    sig: [u8; 4],
+    /// Absolute offset of the next chunk.
+    next_offset: u64,
+    block_size: u32,
+    chunk_header_size: u16,
+    chunk_footer_size: u16,
+    data_type: u8,
+    contents_end: bool,
+    /// First 13 payload bytes (the payload starts at chunk offset 0x20).
+    head: [u8; 13],
+}
+
+impl ChunkHeader {
+    /// Payload length: block size minus chunk header and footer sizes. Only
+    /// evaluated for chunks whose payload is read, as before.
+    fn read_data_len(&self) -> usize {
+        self.block_size as usize - self.chunk_header_size as usize - self.chunk_footer_size as usize
+    }
+}
+
+/// Read the chunk header at `chunk_start`, where the reader must be
+/// positioned. Returns `None` when fewer than 4 bytes (a signature) remain or
+/// the signature read fails, matching the old `while let Ok(sig)` loop;
+/// a chunk truncated after its signature is an error, as before. Leaves the
+/// reader at `chunk_start + CHUNK_PREFIX_LEN`.
+fn read_chunk_header<R: Read + Seek>(
+    reader: &mut Reader<R>,
+    chunk_start: u64,
+) -> Result<Option<ChunkHeader>, UsmError> {
+    let mut buf = [0u8; CHUNK_PREFIX_LEN];
+    let (filled, result) = reader.read_up_to(&mut buf);
+    if filled < 4 {
+        return Ok(None);
+    }
+    result?;
+    if filled < CHUNK_PREFIX_LEN {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+    }
+
+    let block_size = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+    let chunk_header_size = u16::from_be_bytes(buf[8..10].try_into().unwrap());
+    let chunk_footer_size = u16::from_be_bytes(buf[10..12].try_into().unwrap());
+    let data_type = (buf[15] as i8 & 0b11) as u8;
+    Ok(Some(ChunkHeader {
+        sig: buf[0..4].try_into().unwrap(),
+        next_offset: chunk_start + 8 + block_size as u64,
+        block_size,
+        chunk_header_size,
+        chunk_footer_size,
+        data_type,
+        contents_end: &buf[0x20..] == b"#CONTENTS END",
+        head: buf[0x20..].try_into().unwrap(),
+    }))
+}
+
 /// Extract USM chunks
 fn extract_usm_chunks<R: Read + Seek, W: Write>(
     reader: &mut Reader<R>,
@@ -664,42 +726,24 @@ fn extract_usm_chunks<R: Read + Seek, W: Write>(
     vmask: Option<&VideoMask>,
     amask: Option<&AudioMask>,
 ) -> Result<(), UsmError> {
-    while let Ok(next_sig) = reader.read_bytes(4) {
-        let block_size = reader.read_u32()?;
-        let current_pos = reader.stream_position()?;
-        let next_offset = current_pos + block_size as u64;
-
-        let chunk_header_size = reader.read_u16()?;
-        let chunk_footer_size = reader.read_u16()?;
-        let _ = reader.read_bytes(3)?;
-        let data_type_byte = reader.read_i8()?;
-        let data_type = (data_type_byte & 0b11) as u8;
-        reader.seek(SeekFrom::Current(16))?;
-
-        let contents_end = reader.read_bytes(13)?;
-        if &contents_end == b"#CONTENTS END" {
-            // Each stream emits its own #CONTENTS END; skip it and keep reading to
-            // EOF. Breaking here truncates the longer stream (PyCriCodecs usm.py).
-            reader.seek(SeekFrom::Start(next_offset))?;
-            continue;
+    let mut chunk_start = reader.stream_position()?;
+    while let Some(chunk) = read_chunk_header(reader, chunk_start)? {
+        // Each stream emits its own #CONTENTS END; skip it and keep reading to
+        // EOF. Breaking here truncates the longer stream (PyCriCodecs usm.py).
+        if !chunk.contents_end {
+            reader.seek(SeekFrom::Start(chunk_start + 0x20))?;
+            process_chunk(
+                reader,
+                &chunk.sig,
+                chunk.read_data_len(),
+                chunk.data_type,
+                video_file,
+                &mut audio_file,
+                vmask,
+                amask,
+            )?;
         }
-
-        reader.seek(SeekFrom::Current(-13))?;
-        let read_data_len =
-            block_size as usize - chunk_header_size as usize - chunk_footer_size as usize;
-
-        process_chunk(
-            reader,
-            &next_sig,
-            read_data_len,
-            data_type,
-            video_file,
-            &mut audio_file,
-            vmask,
-            amask,
-        )?;
-
-        reader.seek(SeekFrom::Start(next_offset))?;
+        chunk_start = reader.seek(SeekFrom::Start(chunk.next_offset))?;
     }
 
     Ok(())
@@ -726,39 +770,20 @@ fn extract_usm_chunks_to_memory<R: Read + Seek>(
     let mut video = Vec::with_capacity(remaining);
     let mut audio = if export_audio { Some(Vec::new()) } else { None };
 
-    while let Ok(next_sig) = reader.read_bytes(4) {
-        let block_size = reader.read_u32()?;
-        let current_pos = reader.stream_position()?;
-        let next_offset = current_pos + block_size as u64;
-
-        let chunk_header_size = reader.read_u16()?;
-        let chunk_footer_size = reader.read_u16()?;
-        let _ = reader.read_bytes(3)?;
-        let data_type_byte = reader.read_i8()?;
-        let data_type = (data_type_byte & 0b11) as u8;
-        reader.seek(SeekFrom::Current(16))?;
-
-        let contents_end = reader.read_bytes(13)?;
-        if &contents_end == b"#CONTENTS END" {
-            // Each stream emits its own #CONTENTS END; skip it and keep reading to
-            // EOF. Breaking here truncates the longer stream (PyCriCodecs usm.py).
-            reader.seek(SeekFrom::Start(next_offset))?;
-            continue;
-        }
-
-        reader.seek(SeekFrom::Current(-13))?;
-        let read_data_len =
-            block_size as usize - chunk_header_size as usize - chunk_footer_size as usize;
-
-        if next_sig == b"@SFV" {
-            read_usm_chunk_into(reader, read_data_len, data_type, vmask, None, &mut video)?;
-        } else if next_sig == b"@SFA" {
-            if let Some(audio) = audio.as_mut() {
-                read_usm_chunk_into(reader, read_data_len, data_type, None, amask, audio)?;
+    let mut chunk_start = here;
+    while let Some(chunk) = read_chunk_header(reader, chunk_start)? {
+        // Each stream emits its own #CONTENTS END; skip it and keep reading to
+        // EOF. Breaking here truncates the longer stream (PyCriCodecs usm.py).
+        if !chunk.contents_end {
+            if &chunk.sig == b"@SFV" {
+                read_usm_chunk_into(reader, &chunk, vmask, None, &mut video)?;
+            } else if &chunk.sig == b"@SFA" {
+                if let Some(audio) = audio.as_mut() {
+                    read_usm_chunk_into(reader, &chunk, None, amask, audio)?;
+                }
             }
         }
-
-        reader.seek(SeekFrom::Start(next_offset))?;
+        chunk_start = reader.seek(SeekFrom::Start(chunk.next_offset))?;
     }
 
     let mut streams = vec![ExtractedUsmStream {
@@ -779,17 +804,25 @@ fn extract_usm_chunks_to_memory<R: Read + Seek>(
 
 /// Read one chunk payload straight into the tail of `out` (single copy from
 /// the source, no intermediate buffer), de-masking in place when needed.
+///
+/// The reader sits just past the chunk prefix, which already holds the first
+/// 13 payload bytes (`chunk.head`), so those are copied rather than re-read.
 fn read_usm_chunk_into<R: Read + Seek>(
     reader: &mut Reader<R>,
-    read_data_len: usize,
-    data_type: u8,
+    chunk: &ChunkHeader,
     vmask: Option<&VideoMask>,
     amask: Option<&AudioMask>,
     out: &mut Vec<u8>,
 ) -> Result<(), UsmError> {
     let start = out.len();
-    reader.read_into_vec(read_data_len, out)?;
-    if data_type != 0 {
+    let len = chunk.read_data_len();
+    let from_head = len.min(chunk.head.len());
+    out.extend_from_slice(&chunk.head[..from_head]);
+    if let Err(e) = reader.read_into_vec(len - from_head, out) {
+        out.truncate(start);
+        return Err(e.into());
+    }
+    if chunk.data_type != 0 {
         return Ok(());
     }
     if let Some(vmask) = vmask {
@@ -1169,5 +1202,121 @@ mod tests {
             n,
             iters
         );
+    }
+
+    /// One raw stream chunk: header size 0x18, so the payload starts at 0x20.
+    fn raw_chunk(sig: &[u8; 4], payload: &[u8], footer: usize, data_type: u8) -> Vec<u8> {
+        let mut c = Vec::new();
+        c.extend_from_slice(sig);
+        c.extend_from_slice(&((0x18 + payload.len() + footer) as u32).to_be_bytes());
+        c.extend_from_slice(&0x18u16.to_be_bytes());
+        c.extend_from_slice(&(footer as u16).to_be_bytes());
+        c.extend_from_slice(&[0, 0, 0, data_type]);
+        c.extend_from_slice(&[0u8; 16]);
+        c.extend_from_slice(payload);
+        c.extend(std::iter::repeat_n(0xEEu8, footer));
+        c
+    }
+
+    /// The chunk loop as it was before chunk headers were read in one call:
+    /// a dozen small reads/seeks per chunk. Kept as the differential oracle.
+    fn reference_chunks(
+        data: &[u8],
+        vmask: Option<&VideoMask>,
+        amask: Option<&AudioMask>,
+    ) -> Result<(Vec<u8>, Vec<u8>), UsmError> {
+        let mut reader = Reader::new(std::io::Cursor::new(data));
+        let (mut video, mut audio) = (Vec::new(), Vec::new());
+        while let Ok(next_sig) = reader.read_bytes(4) {
+            let block_size = reader.read_u32()?;
+            let current_pos = reader.stream_position()?;
+            let next_offset = current_pos + block_size as u64;
+            let chunk_header_size = reader.read_u16()?;
+            let chunk_footer_size = reader.read_u16()?;
+            let _ = reader.read_bytes(3)?;
+            let data_type = (reader.read_i8()? & 0b11) as u8;
+            reader.seek(SeekFrom::Current(16))?;
+            if &reader.read_bytes(13)? == b"#CONTENTS END" {
+                reader.seek(SeekFrom::Start(next_offset))?;
+                continue;
+            }
+            reader.seek(SeekFrom::Current(-13))?;
+            let len = block_size as usize - chunk_header_size as usize - chunk_footer_size as usize;
+            let mut content = reader.read_bytes(len)?;
+            if &next_sig == b"@SFV" {
+                if let (0, Some(m)) = (data_type, vmask) {
+                    mask_video(&mut content, m);
+                }
+                video.extend_from_slice(&content);
+            } else if &next_sig == b"@SFA" {
+                if let (0, Some(m)) = (data_type, amask) {
+                    mask_audio(&mut content, m);
+                }
+                audio.extend_from_slice(&content);
+            }
+            reader.seek(SeekFrom::Start(next_offset))?;
+        }
+        Ok((video, audio))
+    }
+
+    fn new_chunks_memory(
+        data: &[u8],
+        vmask: Option<&VideoMask>,
+        amask: Option<&AudioMask>,
+    ) -> Result<(Vec<u8>, Vec<u8>), UsmError> {
+        let mut reader = Reader::new(std::io::Cursor::new(data));
+        let streams =
+            extract_usm_chunks_to_memory(&mut reader, "t".into(), true, vmask, amask, None, None)?;
+        Ok((streams[0].data.clone(), streams[1].data.clone()))
+    }
+
+    fn new_chunks_writer(
+        data: &[u8],
+        vmask: Option<&VideoMask>,
+        amask: Option<&AudioMask>,
+    ) -> Result<(Vec<u8>, Vec<u8>), UsmError> {
+        let mut reader = Reader::new(std::io::Cursor::new(data));
+        let (mut video, mut audio) = (Vec::new(), Vec::new());
+        extract_usm_chunks(&mut reader, &mut video, Some(&mut audio), vmask, amask)?;
+        Ok((video, audio))
+    }
+
+    #[test]
+    fn chunk_loop_matches_reference() {
+        let (vmask, amask) = get_mask(TEST_KEY);
+        let mut stream = Vec::new();
+        stream.extend(raw_chunk(b"@SFV", &lcg_fill(0x400), 4, 0)); // masked size
+        stream.extend(raw_chunk(b"@SFA", &lcg_fill(0x180), 0, 0)); // no footer
+        stream.extend(raw_chunk(b"@SFA", b"tiny!", 3, 0)); // payload < 13 bytes
+        stream.extend(raw_chunk(b"@SFV", &[], 0, 0)); // empty payload
+        stream.extend(raw_chunk(b"@SFV", &lcg_fill(0x300), 8, 1)); // metadata
+        stream.extend(raw_chunk(b"@CUE", &lcg_fill(0x40), 0, 0)); // ignored
+        stream.extend(raw_chunk(b"@SFV", b"#CONTENTS END===", 0, 2));
+        stream.extend(raw_chunk(b"@SFA", &lcg_fill(0x250), 2, 0)); // after one end
+        stream.extend(raw_chunk(b"@SFA", b"#CONTENTS END===", 0, 2));
+
+        let masks: [(Option<&VideoMask>, Option<&AudioMask>); 2] =
+            [(None, None), (Some(&vmask), Some(&amask))];
+        for (vm, am) in masks {
+            // Clean end, and trailing bytes too short for a signature.
+            for tail in [&[][..], &[1, 2, 3][..]] {
+                let mut data = stream.clone();
+                data.extend_from_slice(tail);
+                let want = reference_chunks(&data, vm, am).unwrap();
+                assert!(!want.0.is_empty() && !want.1.is_empty());
+                assert_eq!(new_chunks_memory(&data, vm, am).unwrap(), want);
+                assert_eq!(new_chunks_writer(&data, vm, am).unwrap(), want);
+            }
+        }
+
+        // A chunk cut off anywhere after its signature is an error for both.
+        let last = raw_chunk(b"@SFV", &lcg_fill(0x40), 4, 0);
+        for cut in [4, 10, 0x20, 0x2C, 0x2D, 0x40, last.len() - 5] {
+            let mut data = stream.clone();
+            data.extend_from_slice(&last[..cut]);
+            assert!(reference_chunks(&data, None, None).is_err(), "cut {cut}");
+            assert!(new_chunks_memory(&data, None, None).is_err(), "cut {cut}");
+            assert!(new_chunks_writer(&data, None, None).is_err(), "cut {cut}");
+        }
     }
 }
