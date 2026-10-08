@@ -4,8 +4,9 @@ These are confirmed divergences from CRI/vgmstream behavior that are **intention
 not implemented yet**. All of them are **non-essential for the common decode/extract
 path** (and specifically for Project Sekai assets, which use unencrypted HCA-MX in
 ACB/AWB and VP9 USM). They are deferred because they are either pure performance,
-unreachable without new API, or deep restructures with **no test fixtures**, where a
-blind change to working code carries more regression risk than value.
+encoder-only paths with nothing to validate against, or deep restructures with **no
+test fixtures**, where a blind change to working code carries more regression risk
+than value.
 
 Verified against vgmstream `3f860bef` (`src/coding/libs/clhca.c`, `src/meta/acb.c`,
 `src/meta/awb.c`) and PyCriCodecs `usm.py` / `acb.py`.
@@ -29,7 +30,7 @@ item-type 1 (Waveform). vgmstream (`acb.c:481-600`) also accepts noteOn `2003`, 
 Cue `ReferenceType == 8` is currently routed through the Sequence path. vgmstream uses a
 dedicated `load_acb_blocksequence` → `load_acb_block` over the Block/BlockSequence tables
 (`acb.c:826-968`), which cridecoder does not parse. (Unknown ref types are now skipped
-rather than erroring; see commit `e958c9f`.)
+rather than erroring; landed in PR #10, `025e47e`.)
 - **Impact:** none for pjsk (cues are type 3).
 - **Why deferred:** requires new Block/BlockSequence table parsing; implementable from
   vgmstream but unverifiable without a type-8 fixture.
@@ -61,10 +62,12 @@ chunks merge into one audio output. vgmstream/PyCriCodecs key outputs by
 The encoder does not apply CRI's loop pipeline (delay bump, 2048-byte loop-frame
 alignment, post-loop tail) from `clhca.c`, so a loop encoded by cridecoder would loop at
 the wrong sample in clHCA players.
-- **Status:** there is currently **no builder/encoder API that exposes loop config**, so
-  this code path is unreachable — implementing it would be dead, untestable code.
-  `HcaEncoderConfig.loop_start/loop_end` (if/when added) are therefore **not
-  CRI-accurate**. Documented here rather than implemented.
+- **Status:** `HcaEncoderConfig` already has public `loop_start` / `loop_end` fields.
+  When both are set, the encoder writes a `loop` header chunk that only offsets the
+  points by the encoder delay, without CRI's alignment, so those loop points are **not
+  CRI-accurate**. The Python `encode_hca*` bindings do not expose them.
+- **Why deferred:** no test sets encoder loop points and there is no clHCA-player
+  check to validate a CRI-accurate pipeline against; encoding is not on the pjsk path.
 
 ### MDCT is O(N²) — `src/hca/encoder.rs`
 `mdct_transform` computes the forward DCT-IV as a naive double loop (`cos()` per (n,k)

@@ -54,6 +54,7 @@ High-level decode (extract + HCA decode in one call, per-AWB AFS2 subkey applied
 
 - `decode_acb_to_wav_from_file()` / `decode_acb_to_wav()` — write decoded WAVs to a directory
 - `decode_acb_to_wav_to_memory()` — return decoded `DecodedAcbTrack`s in memory; encrypted (type-56) ACBs need only the global keycode
+- Each has a `*_parallel` variant taking a `threads` budget (tracks decoded concurrently, block-parallel HCA decoding for the leftover budget; output identical, `threads <= 1` is serial)
 
 Other entry points:
 
@@ -62,7 +63,7 @@ Other entry points:
 - `ClHca` — low-level HCA decoder state machine
 - `extract_usm_file()` / `extract_usm()` — USM extraction (disk); `extract_usm_to_memory()` — in-memory; `UsmBuilder` — build USM
 
-**Python bindings** (`src/python.rs`, behind the `python` feature) mirror this surface. Each disk function has a `*_bytes` in-memory counterpart that takes/returns `bytes` via `Cursor` (no `.to_vec()` copy). The `.pyi` stubs in `cridecoder.pyi` are the source of truth for the Python signatures and must stay in sync with the bindings.
+**Python bindings** (`src/python.rs`, behind the `python` feature) mirror this surface. Most disk functions have a `*_bytes` in-memory counterpart that takes/returns `bytes` via `Cursor` (no `.to_vec()` copy); the exceptions are `extract_acb` / `extract_acb_tracks`, which share `extract_acb_bytes` (embedded AWB only — external `.awb` needs the disk path), and `read_usm_metadata`, which is disk-only. The `.pyi` stubs in `cridecoder.pyi` are the source of truth for the Python signatures and must stay in sync with the bindings.
 
 ## Building
 
@@ -110,6 +111,7 @@ Allowed types:
 | `[Chore]` | Maintenance, refactoring, dependency or build changes |
 | `[Docs]`  | Documentation-only changes                            |
 | `[Perf]`  | Performance improvement (no behavior change)          |
+| `[CI]`    | CI / release workflow changes                         |
 
 Rules:
 
@@ -118,7 +120,7 @@ Rules:
 - No trailing period.
 - Keep the subject at or below roughly 70 characters.
 - **Agent attribution uses the standard Git `Co-authored-by:` trailer in the commit body, not a free-form `Agent:` line.** This makes GitHub render the co-author avatar on the commit page. The trailer must be on its own line, separated from the subject by a blank line, in the form `Co-authored-by: <Display Name> <email>`. Suggested values per agent:
-  - Claude (any 4.x): `Co-authored-by: Claude Opus 4.7 <noreply@anthropic.com>` (substitute the actual model, e.g. `Claude Sonnet 4.6`, `Claude Haiku 4.5`)
+  - Claude: `Co-authored-by: Claude <Model> <noreply@anthropic.com>` (substitute the actual model name, e.g. `Claude Opus 4.7`, `Claude Sonnet 4.6`)
   - Codex: `Co-authored-by: Codex <noreply@openai.com>`
   - Copilot: `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>`
 

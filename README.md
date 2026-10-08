@@ -197,8 +197,9 @@ for wf in cridecoder.extract_acb_unique_bytes(acb):
 wav = cridecoder.decode_hca_bytes(open("audio.hca", "rb").read())
 ```
 
-Every disk-based function has an in-memory `*_bytes` counterpart that takes and
-returns `bytes`. See `cridecoder.pyi` for the full typed signatures.
+Most disk-based functions have an in-memory `*_bytes` counterpart that takes and
+returns `bytes` (`extract_acb` / `extract_acb_tracks` share `extract_acb_bytes`;
+`read_usm_metadata` is disk-only). See `cridecoder.pyi` for the full typed signatures.
 
 ## Supported Formats
 

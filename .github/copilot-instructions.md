@@ -1,8 +1,11 @@
 # Copilot Instructions for cridecoder
 
+[`AGENTS.md`](../AGENTS.md) is the single source of truth for this repository; if this file
+and AGENTS.md disagree, follow AGENTS.md.
+
 ## Project Context
 
-This is a pure Rust library (`cridecoder`) for decoding CRI Middleware audio/video formats (ACB, HCA, USM). The CRI format implementation is based on [vgmstream](https://github.com/vgmstream/vgmstream). It also provides optional Python bindings via pyo3/maturin.
+This is a pure Rust library (`cridecoder`) for decoding CRI Middleware audio/video formats (ACB, HCA, USM). The CRI format implementation is based on [vgmstream](https://github.com/vgmstream/vgmstream) and [PyCriCodecs](https://github.com/Youjose/PyCriCodecs/). It also provides optional Python bindings via pyo3/maturin.
 
 ## Code Style
 
@@ -18,15 +21,15 @@ This is a pure Rust library (`cridecoder`) for decoding CRI Middleware audio/vid
 
 - The `ClHca` struct (HCA decoder state) is very large (~200KB on stack). Use `RUST_MIN_STACK=16777216` when running integration tests
 - ACB files may contain embedded AWB data or reference external `.awb` files
-- HCA files support encryption — use `HcaDecoder::set_key()` or `KeyTest` for key testing
-- USM files contain interleaved video (M2V) and audio (ADX) chunks with XOR masking
+- HCA files support encryption — use `HcaDecoder::set_encryption_key(keycode, subkey)`, or `HcaDecoder::test_key()` with a `KeyTest` for key testing (`ClHca::set_key()` is the low-level equivalent)
+- USM files interleave video (`@SFV`: VP9 → `.ivf`, otherwise MPEG2 → `.m2v`) and audio (`@SFA`: ADX or HCA) chunks; the USM audio XOR mask applies only to ADX, since HCA has its own cipher
 
 ## Public API
 
 ```rust
 // ACB
 pub fn extract_acb_from_file(path, output_dir) -> Result<Option<Vec<String>>>
-pub fn extract_acb(reader, output_dir, awb_reader) -> Result<Vec<String>>
+pub fn extract_acb(reader, output_dir, acb_file_path: Option<&Path>) -> Result<Vec<String>>  // path locates an external .awb
 
 // HCA
 pub struct HcaDecoder { ... }
@@ -66,6 +69,8 @@ Allowed types:
 | `[Fix]`   | Bug fix                                               |
 | `[Chore]` | Maintenance, refactoring, dependency or build changes |
 | `[Docs]`  | Documentation-only changes                            |
+| `[Perf]`  | Performance improvement (no behavior change)          |
+| `[CI]`    | CI / release workflow changes                         |
 
 Rules:
 
@@ -74,7 +79,7 @@ Rules:
 - No trailing period.
 - Keep the subject at or below roughly 70 characters.
 - **Agent attribution uses the standard Git `Co-authored-by:` trailer in the commit body, not a free-form `Agent:` line.** This makes GitHub render the co-author avatar on the commit page. The trailer must be on its own line, separated from the subject by a blank line, in the form `Co-authored-by: <Display Name> <email>`. Suggested values per agent:
-  - Claude (any 4.x): `Co-authored-by: Claude Opus 4.7 <noreply@anthropic.com>` (substitute the actual model, e.g. `Claude Sonnet 4.6`, `Claude Haiku 4.5`)
+  - Claude: `Co-authored-by: Claude <Model> <noreply@anthropic.com>` (substitute the actual model name, e.g. `Claude Opus 4.7`, `Claude Sonnet 4.6`)
   - Codex: `Co-authored-by: Codex <noreply@openai.com>`
   - Copilot: `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>`
 
