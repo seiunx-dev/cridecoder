@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "cridecoder"
-version = "0.3.6"
+version = "0.3.7"
 description = "CRI codec library for ACB/AWB, HCA audio, and USM video extraction"
 readme = "README.md"
 license = { text = "MIT" }
