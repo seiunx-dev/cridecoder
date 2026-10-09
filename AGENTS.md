@@ -153,7 +153,8 @@ The files in `.github/workflows` are thin callers:
   (which rewrote the version from the tag with `sed`). Bump `version` in **both**
   `Cargo.toml` and `pyproject.toml` (and the package's own entry in `Cargo.lock`) in a PR
   → merge and wait for `CI OK` on `main` → push the tag `v<version>`. Pushing the tag
-  creates the GitHub Release; do not create the Release by hand first.
+  creates the GitHub Release; do not create the Release by hand first (rewrite its notes
+  afterwards, see [Release notes](#release-notes)).
   `release-gate` refuses a tag that differs from `Cargo.toml` and waits for `CI OK` on
   the tagged commit; then the wheels are built (not abi3: one wheel per interpreter,
   linux x64/arm64 in the manylinux container, macOS arm64/x64 and Windows x64 for
@@ -179,3 +180,17 @@ Workflow maintenance rules:
   references.
 - Third-party actions in caller-side custom steps are pinned to a full commit SHA with a
   `# vX.Y.Z` comment; Dependabot (`github-actions`) updates them and the template refs.
+
+## Release notes
+
+Release notes follow the org standard,
+[`RELEASE_NOTES.md` in seiunx-dev/ci-templates](https://github.com/seiunx-dev/ci-templates/blob/main/RELEASE_NOTES.md).
+
+- Title every release with the tag only, e.g. `v0.3.7`; write the notes in English.
+- Publish tags with an `-alpha`, `-beta` or `-rc` suffix as pre-releases, all others as
+  regular releases; every tag gets a release.
+- Omit empty sections, and end every item with its PR number `(#123)`, or the short
+  commit SHA when there is no PR.
+- `release.yml` publishes the Release with auto-generated notes when the tag is pushed;
+  once it has finished, rewrite the body to the standard (`gh release edit <tag>
+  --notes-file <file>`).
