@@ -919,7 +919,9 @@ impl ClHca {
             bit_pos / 8
         };
 
-        for &byte in &data[byte_start..(self.frame_size as usize).saturating_sub(0x02)] {
+        // The last read can end inside the checksum, past the zero padding.
+        let padding_end = (self.frame_size as usize).saturating_sub(0x02);
+        for &byte in &data[byte_start.min(padding_end)..padding_end] {
             if byte != 0 {
                 return -1;
             }
@@ -1528,6 +1530,18 @@ pub(crate) fn pcm_f32_to_i16(sample: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_bitreader_allows_read_into_checksum() {
+        let mut hca = ClHca::new();
+        hca.frame_size = 340;
+        let data = vec![0u8; 340];
+
+        // 14 bits may remain, so the last read ends inside the checksum and
+        // the first padding byte lies past the end of the padding.
+        assert_eq!(hca.validate_bitreader(&data, 340 * 8 - 14), 0);
+        assert_eq!(hca.validate_bitreader(&data, 340 * 8 - 13), -2);
+    }
 
     #[test]
     fn test_crc16_checksum() {
