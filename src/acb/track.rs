@@ -39,8 +39,8 @@ struct AcbTables {
     nams: UtfTable,
     wavs: Option<UtfTable>,
     syns: Option<UtfTable>,
-    tras: UtfTable,
-    tevs: UtfTable,
+    tras: Option<UtfTable>,
+    tevs: Option<UtfTable>,
     seqs: Option<UtfTable>,
 }
 
@@ -120,8 +120,16 @@ fn parse_utf_tables(table_bytes: &HashMap<&str, Vec<u8>>) -> Result<AcbTables, T
         .map(|d| UtfTable::new(Cursor::new(d)))
         .transpose()?;
 
-    let tras = UtfTable::new(Cursor::new(&table_bytes["TrackTable"]))?;
-    let tevs = UtfTable::new(Cursor::new(&table_bytes["TrackEventTable"]))?;
+    let tras = table_bytes
+        .get("TrackTable")
+        .filter(|d| !d.is_empty())
+        .map(|d| UtfTable::new(Cursor::new(d)))
+        .transpose()?;
+    let tevs = table_bytes
+        .get("TrackEventTable")
+        .filter(|d| !d.is_empty())
+        .map(|d| UtfTable::new(Cursor::new(d)))
+        .transpose()?;
 
     let seqs = table_bytes
         .get("SequenceTable")
@@ -158,8 +166,24 @@ fn extract_tracks_from_tables(
 ) -> Result<(), TrackError> {
     for (cue_index, cue_row) in tables.cues.rows.iter().enumerate() {
         let ref_type = get_int_field(cue_row, "ReferenceType") as i32;
+        let cue_index = cue_index as i32;
+        let ref_index = get_int_field(cue_row, "ReferenceIndex") as usize;
+
+        if ref_type == 1 {
+            if let Some(track) = extract_track_from_waveform(
+                tables.wavs.as_ref(),
+                name_map,
+                cue_index,
+                ref_index,
+                seen,
+            ) {
+                tl.tracks.push(track);
+            }
+            continue;
+        }
+
         // vgmstream skips cues with an unhandled ReferenceType rather than failing
-        // the whole ACB (acb.c). We handle 3 (Sequence) and 8 (BlockSequence).
+        // the whole ACB (acb.c). Track graphs use 3 (Sequence) or 8 (BlockSequence).
         if ref_type != 3 && ref_type != 8 {
             continue;
         }
@@ -167,9 +191,6 @@ fn extract_tracks_from_tables(
         // The cue NAME binds to the cue's row position (CueIndex); ReferenceIndex
         // only indexes the Sequence/Synth tables for descent. They differ when
         // CueTable order != SequenceTable order, so thread both (vgmstream acb.c).
-        let cue_index = cue_index as i32;
-        let ref_index = get_int_field(cue_row, "ReferenceIndex") as usize;
-
         if let Some(seqs) = &tables.seqs {
             if ref_index < seqs.rows.len() {
                 extract_sequence_tracks(tables, name_map, ref_index, cue_index, tl, seen);
@@ -191,6 +212,10 @@ fn extract_sequence_tracks(
     tl: &mut TrackList,
     seen: &mut HashSet<String>,
 ) {
+    let Some(tras) = &tables.tras else {
+        return;
+    };
+
     if let Some(seqs) = &tables.seqs {
         let seq = &seqs.rows[ref_index];
         let num_tracks = get_int_field(seq, "NumTracks") as usize;
@@ -202,7 +227,7 @@ fn extract_sequence_tracks(
                 }
                 let idx = u16::from_be_bytes([track_index_data[i * 2], track_index_data[i * 2 + 1]])
                     as usize;
-                if idx < tables.tras.rows.len() {
+                if idx < tras.rows.len() {
                     extract_track_from_track_row(tables, name_map, cue_index, idx, tl, seen);
                 }
             }
@@ -217,7 +242,11 @@ fn extract_direct_tracks(
     tl: &mut TrackList,
     seen: &mut HashSet<String>,
 ) {
-    for idx in 0..tables.tras.rows.len() {
+    let Some(tras) = &tables.tras else {
+        return;
+    };
+
+    for idx in 0..tras.rows.len() {
         extract_track_from_track_row(tables, name_map, cue_index, idx, tl, seen);
     }
 }
@@ -230,15 +259,18 @@ fn extract_track_from_track_row(
     tl: &mut TrackList,
     seen: &mut HashSet<String>,
 ) {
-    let track = &tables.tras.rows[track_idx];
+    let (Some(tras), Some(tevs)) = (&tables.tras, &tables.tevs) else {
+        return;
+    };
+    let track = &tras.rows[track_idx];
     let event_idx = get_int_field(track, "EventIndex") as usize;
 
-    if event_idx == 0xFFFF || event_idx >= tables.tevs.rows.len() {
+    if event_idx == 0xFFFF || event_idx >= tevs.rows.len() {
         return;
     }
 
     let tracks = extract_tracks_from_event(
-        &tables.tevs.rows[event_idx],
+        &tevs.rows[event_idx],
         tables.syns.as_ref(),
         tables.wavs.as_ref(),
         name_map,
@@ -332,12 +364,18 @@ fn extract_track_from_command(
         return None;
     }
 
-    let wavs = wavs?;
-    if wav_idx >= wavs.rows.len() {
-        return None;
-    }
+    extract_track_from_waveform(wavs, name_map, cue_index, wav_idx, seen)
+}
 
-    let wav_row = &wavs.rows[wav_idx];
+fn extract_track_from_waveform(
+    wavs: Option<&UtfTable>,
+    name_map: &HashMap<i32, String>,
+    cue_index: i32,
+    wav_idx: usize,
+    seen: &mut HashSet<String>,
+) -> Option<Track> {
+    let wavs = wavs?;
+    let wav_row = wavs.rows.get(wav_idx)?;
     let is_stream = get_int_field(wav_row, "Streaming") != 0;
     let enc_type = get_int_field(wav_row, "EncodeType") as i32;
 
